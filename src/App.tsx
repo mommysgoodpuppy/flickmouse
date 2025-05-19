@@ -251,6 +251,7 @@ function performThrowOrCatchAction(watchEntity: Entity) {
     return; 
   }
   lastTapActionTimestamp = now;
+  watchEntity.set(LastTapTime, { value: new Date(now) });
 
   if (watchEntity.get(IsThrowPending)?.value) {
     console.log('[performThrowOrCatchAction] Action ignored, throw already pending from lookahead.');
@@ -425,12 +426,12 @@ function WatchManager({ watchEntity }: { watchEntity: Entity }) {
     };
   }, [watchEntity]); // Removed sdkWatchRef from dependency array as watch instance is stable within useEffect
 
-  const isConnectedValue = useTrait(watchEntity, IsConnected)?.value;
-  const hapticsAvailableValue = useTrait(watchEntity, HapticsAvailable)?.value;
-  const flickSensitivityTrait = useTrait(watchEntity, FlickSensitivity);                // For UI
-  const configurableLookaheadDelayMsTrait = useTrait(watchEntity, ConfigurableLookaheadDelayMs); // For UI
-  const isThrowPendingTrait = useTrait(watchEntity, IsThrowPending); // For UI debug
-  const enableCurveballTrait = useTrait(watchEntity, EnableCurveball); // For UI
+  const _isConnectedValue = useTrait(watchEntity, IsConnected)?.value;
+  const _hapticsAvailableValue = useTrait(watchEntity, HapticsAvailable)?.value;
+  const _flickSensitivityTrait = useTrait(watchEntity, FlickSensitivity);                // For UI
+  const _configurableLookaheadDelayMsTrait = useTrait(watchEntity, ConfigurableLookaheadDelayMs); // For UI
+  const _isThrowPendingTrait = useTrait(watchEntity, IsThrowPending); // For UI debug
+  const _enableCurveballTrait = useTrait(watchEntity, EnableCurveball); // For UI
 
 
 
@@ -608,7 +609,7 @@ function R3FMouseCursor({ entity }: { entity: Entity }) {
 
   return (
     <mesh ref={meshRef} position={[initialMeshX, initialMeshY, 0]}>
-      <circleGeometry args={[30, 32]} /> 
+      <circleGeometry args={[10, 32]} /> 
       <meshBasicMaterial color={isCurrentlyThrownForColor ? "red" : "blue"} />
     </mesh>
   );
