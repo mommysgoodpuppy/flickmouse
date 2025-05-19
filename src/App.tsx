@@ -13,7 +13,7 @@ interface Vector2 { x: number; y: number; }
 interface TouchScreenResolution { width: number; height: number; }
 interface GestureProbDetail { [key: string]: number; }
 
-const ARM_DIRECTION_HISTORY_MAX_AGE_MS = 100; // Max age of samples in history
+const ARM_DIRECTION_HISTORY_MAX_AGE_MS = 200; // Max age of samples in history (increased for lookahead)
 const MIN_THROW_SPEED_THRESHOLD = 5.0;    // Speed (pixels/sec) below which throw stops
 const DEBUG_LINE_VISUAL_SCALE = 0.1;      // Scales potential throw speed to debug line length
 const TAP_ACTION_DEBOUNCE_MS = 100;       // Debounce time for tap/flick actions
@@ -31,6 +31,8 @@ const ConfigurableThrowWindowMs = trait({ value: 50 });
 const ShowDebugLine = trait({ value: false }); 
 const ConfigurableThrowStrength = trait({ value: 500 }); // New trait for throw strength
 const FlickSensitivity = trait({ value: 0.0 });          // New trait for flick sensitivity (0.0 to 1.0)
+const ConfigurableLookaheadDelayMs = trait({ value: 30 }); // New trait for lookahead delay
+const IsThrowPending = trait({ value: false });           // True if waiting for lookahead to complete for a throw
 
 const IsConnected = trait({ value: false });
 const Hand = trait({ value: null as string | null });
@@ -58,85 +60,136 @@ export const world = createWorld();
 
 let lastTapActionTimestamp = 0; // For debouncing SDK tap vs. Flick-tap
 
+const executeActualThrowLogic = (watchEntity: Entity, tapTimestamp: number) => {
+  console.log(`[executeActualThrowLogic] Called. TapTimestamp: ${tapTimestamp}`);
+
+  // If the mouse is already considered thrown by Koota state (e.g., caught during lookahead), abort this throw.
+  // This function is meant to *initiate* a throw, so IsThrown should be false at its start.
+  if (watchEntity.get(IsThrown)?.value === true) {
+      console.log('[executeActualThrowLogic] Mouse is already marked as thrown (e.g., caught during lookahead). Aborting this throw attempt.');
+      // IsThrowPending will be cleared by the setTimeout callback that called this.
+      return;
+  }
+
+  const currentThrowStrength = watchEntity.get(ConfigurableThrowStrength)?.value ?? 500;
+  const configurableThrowWindowMs = watchEntity.get(ConfigurableThrowWindowMs)?.value ?? 50;
+  // Get the lookaheadDelay that was active when the throw was initiated, passed via tapTimestamp context.
+  // For calculating sample window, we re-fetch. This could be passed if strictness is needed.
+  const lookaheadDelayMs = watchEntity.get(ConfigurableLookaheadDelayMs)?.value ?? 0; 
+  const history = watchEntity.get(ArmDirectionHistory);
+
+  const historyStartTime = tapTimestamp - configurableThrowWindowMs;
+  const historyEndTime = tapTimestamp + lookaheadDelayMs; 
+
+  console.log(`[executeActualThrowLogic] Calculating throw. Strength: ${currentThrowStrength}, ThrowWindow: ${configurableThrowWindowMs}ms, LookaheadForSampleEnd: ${lookaheadDelayMs}ms`);
+  console.log(`[executeActualThrowLogic] Sample Window (epoch relative): ${historyStartTime} to ${historyEndTime}`);
+
+  const recentSamples = (history?.samples || []).filter(
+    sample => sample.timestamp >= historyStartTime && sample.timestamp <= historyEndTime
+  );
+  console.log(`[executeActualThrowLogic] Found ${recentSamples.length} samples in window.`);
+  if (recentSamples.length > 0 && recentSamples.length <= 5) {
+      console.log('[executeActualThrowLogic] Samples:', recentSamples.map(s => ({dx:s.dx.toFixed(2), dy:s.dy.toFixed(2), ts_delta: s.timestamp - tapTimestamp })));
+  } else if (recentSamples.length > 5) {
+      console.log('[executeActualThrowLogic] First 5 (of '+recentSamples.length+') samples:', recentSamples.slice(0,5).map(s => ({dx:s.dx.toFixed(2), dy:s.dy.toFixed(2), ts_delta: s.timestamp - tapTimestamp })));
+  }
+
+  let throwDx = 0;
+  let throwDy = 0;
+
+  if (recentSamples.length > 0) {
+    let sumDx = 0;
+    let sumDy = 0;
+    for (const sample of recentSamples) {
+      sumDx += sample.dx;
+      sumDy += sample.dy;
+    }
+    throwDx = sumDx / recentSamples.length;
+    throwDy = sumDy / recentSamples.length;
+    console.log(`[executeActualThrowLogic] Using averaged history. Raw Dx:${throwDx.toFixed(3)}, Dy:${throwDy.toFixed(3)}`);
+  } else {
+    const armDir = watchEntity.get(ArmDirection)?.value;
+    console.log('[executeActualThrowLogic] No history samples in window. Fallback ArmDirection value:', armDir);
+    if (armDir && typeof armDir.x === 'number' && typeof armDir.y === 'number') {
+      throwDx = armDir.x;
+      throwDy = armDir.y;
+      console.log(`[executeActualThrowLogic] Using instantaneous ArmDirection. Raw Dx:${throwDx.toFixed(3)}, Dy:${throwDy.toFixed(3)}`);
+    } else {
+      console.log('[executeActualThrowLogic] No valid arm direction data. Cannot throw.');
+      watchEntity.set(IsThrown, { value: false }); // Ensure it remains not thrown
+      return; 
+    }
+  }
+
+  console.log(`[executeActualThrowLogic] Final Raw Vector: Dx:${throwDx.toFixed(3)}, Dy:${throwDy.toFixed(3)}`);
+
+  if (throwDx === 0 && throwDy === 0) {
+      console.log('[executeActualThrowLogic] Calculated throw vector is zero. Mouse remains stationary.');
+      watchEntity.set(IsThrown, { value: false }); 
+      watchEntity.set(MouseVelocity, { x: 0, y: 0 });
+      return;
+  }
+
+  const finalVelX = throwDx * currentThrowStrength;
+  const finalVelY = throwDy * currentThrowStrength;
+
+  watchEntity.set(MouseVelocity, { x: finalVelX, y: finalVelY });
+  watchEntity.set(IsThrown, { value: true });
+  console.log(`[executeActualThrowLogic] Mouse Thrown! Velocity: x:${finalVelX.toFixed(2)}, y:${finalVelY.toFixed(2)}`);
+};
+
 // Refactored core tap/throw/catch logic
 function performThrowOrCatchAction(watchEntity: Entity) {
   const now = Date.now();
   if (now - lastTapActionTimestamp < TAP_ACTION_DEBOUNCE_MS) {
     console.log('[performThrowOrCatchAction] Debounced due to rapid action.');
-    return; // Debounced
+    return; 
   }
   lastTapActionTimestamp = now;
 
+  if (watchEntity.get(IsThrowPending)?.value) {
+    console.log('[performThrowOrCatchAction] Action ignored, throw already pending from lookahead.');
+    return;
+  }
+
   const isCurrentlyThrown = watchEntity.get(IsThrown)?.value ?? false;
-  const currentThrowStrength = watchEntity.get(ConfigurableThrowStrength)?.value ?? 500;
-  console.log(`[performThrowOrCatchAction] Action initiated. IsCurrentlyThrown: ${isCurrentlyThrown}, ThrowStrength: ${currentThrowStrength}`);
+  console.log(`[performThrowOrCatchAction] Action initiated. IsCurrentlyThrown: ${isCurrentlyThrown}`);
 
   if (isCurrentlyThrown) {
-    // Catch the mouse
+    // Catch the mouse - This action is immediate
     watchEntity.set(IsThrown, { value: false });
     watchEntity.set(MouseVelocity, { x: 0, y: 0 });
     console.log('[performThrowOrCatchAction] Mouse Caught (was thrown).');
+    // If a throw was pending, this catch effectively cancels it.
+    if (watchEntity.get(IsThrowPending)?.value) {
+        console.log('[performThrowOrCatchAction] Catch occurred while a throw was pending; clearing pending state.');
+        watchEntity.set(IsThrowPending, { value: false });
+        // Note: The setTimeout for the pending throw will still fire, but executeActualThrowLogic should check IsThrown.
+    }
   } else {
     // Attempt to Throw the mouse
-    const configurableThrowWindow = watchEntity.get(ConfigurableThrowWindowMs)?.value ?? 50;
-    const tapTime = Date.now(); // Use current time for history check
-    const history = watchEntity.get(ArmDirectionHistory);
-
-    console.log(`[performThrowOrCatchAction] Attempting throw. ConfigurableWindowMs: ${configurableThrowWindow}, TapTime: ${tapTime}`);
+    const tapTimestamp = Date.now();
+    const lookaheadDelayMs = watchEntity.get(ConfigurableLookaheadDelayMs)?.value ?? 0;
     
-    const recentSamples = (history?.samples || []).filter(
-      sample => tapTime - sample.timestamp <= (configurableThrowWindow) && tapTime - sample.timestamp >= 0
-    );
-    console.log(`[performThrowOrCatchAction] Found ${recentSamples.length} recent samples in history.`);
-    if (recentSamples.length > 5) { // Log first few samples if many
-        console.log('[performThrowOrCatchAction] First 5 recent samples:', recentSamples.slice(0,5));
-    }
+    console.log(`[performThrowOrCatchAction] Attempting throw. TapTime: ${tapTimestamp}, LookaheadDelayMs: ${lookaheadDelayMs}`);
 
-    let throwDx = 0;
-    let throwDy = 0;
-
-    if (recentSamples.length > 0) {
-      let sumDx = 0;
-      let sumDy = 0;
-      for (const sample of recentSamples) {
-        sumDx += sample.dx;
-        sumDy += sample.dy;
-      }
-      throwDx = sumDx / recentSamples.length;
-      throwDy = sumDy / recentSamples.length;
-      console.log(`[performThrowOrCatchAction] Using averaged history. Calculated Raw Dx:${throwDx.toFixed(3)}, Dy:${throwDy.toFixed(3)}`);
+    if (lookaheadDelayMs > 0) {
+      watchEntity.set(IsThrowPending, { value: true });
+      console.log(`[performThrowOrCatchAction] Scheduling throw logic after ${lookaheadDelayMs}ms for lookahead.`);
+      setTimeout(() => {
+        console.log('[performThrowOrCatchAction] setTimeout: Executing delayed throw logic.');
+        // Only execute if still pending. A catch might have cleared IsThrowPending.
+        if (watchEntity.get(IsThrowPending)?.value) {
+            executeActualThrowLogic(watchEntity, tapTimestamp);
+        }
+        watchEntity.set(IsThrowPending, { value: false });
+        console.log('[performThrowOrCatchAction] setTimeout: Lookahead processing complete, IsThrowPending set to false.');
+      }, lookaheadDelayMs);
     } else {
-      // Fallback to instantaneous if history is insufficient
-      const armDir = watchEntity.get(ArmDirection)?.value;
-      console.log('[performThrowOrCatchAction] No recent history samples. Fallback ArmDirection value:', armDir);
-      if (armDir && typeof armDir.x === 'number' && typeof armDir.y === 'number') { // Added type check for safety
-        throwDx = armDir.x;
-        throwDy = armDir.y;
-        console.log(`[performThrowOrCatchAction] Using instantaneous ArmDirection. Raw Dx:${throwDx.toFixed(3)}, Dy:${throwDy.toFixed(3)}`);
-      } else {
-        console.log('[performThrowOrCatchAction] No valid arm direction data (history or instantaneous). Cannot throw.');
-        return; // No direction to throw
-      }
+      // Execute immediately if no lookahead delay
+      console.log('[performThrowOrCatchAction] Executing throw logic immediately (no lookahead).');
+      executeActualThrowLogic(watchEntity, tapTimestamp);
     }
-
-    console.log(`[performThrowOrCatchAction] Final Raw Throw Vector before zero check: Dx:${throwDx.toFixed(3)}, Dy:${throwDy.toFixed(3)}`);
-
-    if (throwDx === 0 && throwDy === 0) {
-        console.log('[performThrowOrCatchAction] Calculated throw vector is zero, mouse remains caught/stationary.');
-        watchEntity.set(IsThrown, { value: false }); // Ensure it's marked as not thrown
-        watchEntity.set(MouseVelocity, { x: 0, y: 0 });
-        return;
-    }
-
-    const finalVelX = throwDx * currentThrowStrength;
-    const finalVelY = throwDy * currentThrowStrength;
-
-    watchEntity.set(MouseVelocity, { 
-      x: finalVelX, 
-      y: finalVelY 
-    });
-    watchEntity.set(IsThrown, { value: true });
-    console.log(`[performThrowOrCatchAction] Mouse Thrown! Velocity: x:${finalVelX.toFixed(2)}, y:${finalVelY.toFixed(2)}`);
   }
 }
 
@@ -262,6 +315,9 @@ function WatchManager({ watchEntity }: { watchEntity: Entity }) {
 
   const isConnectedValue = useTrait(watchEntity, IsConnected)?.value;
   const hapticsAvailableValue = useTrait(watchEntity, HapticsAvailable)?.value;
+  const flickSensitivityTrait = useTrait(watchEntity, FlickSensitivity);                // For UI
+  const configurableLookaheadDelayMsTrait = useTrait(watchEntity, ConfigurableLookaheadDelayMs); // For UI
+  const isThrowPendingTrait = useTrait(watchEntity, IsThrowPending); // For UI debug
 
   const triggerHaptics = () => {
     if (sdkWatchRef.current && isConnectedValue && hapticsAvailableValue) {
@@ -275,6 +331,8 @@ function WatchManager({ watchEntity }: { watchEntity: Entity }) {
     <>
       <div ref={connectButtonContainerRef} style={{ marginBottom: '20px' }}></div>
       <button type="button" onClick={triggerHaptics} disabled={!hapticsAvailableValue || !isConnectedValue} style={{ marginTop: '10px' }}>Trigger Haptics</button>
+      {/* Debug display for IsThrowPending */}
+      { (isThrowPendingTrait?.value) && <div style={{color: 'orange'}}>Throw Pending (Lookahead)...</div> }
     </>
   );
 }
@@ -560,6 +618,7 @@ function WatchInfoDisplay({ watchEntity }: { watchEntity: Entity }) {
   const showDebugLineTrait = useTrait(watchEntity, ShowDebugLine);
   const configurableThrowStrengthTrait = useTrait(watchEntity, ConfigurableThrowStrength); // For UI
   const flickSensitivityTrait = useTrait(watchEntity, FlickSensitivity);                // For UI
+  const configurableLookaheadDelayMsTrait = useTrait(watchEntity, ConfigurableLookaheadDelayMs); // For UI
 
   return (
     <div className="card">
@@ -649,6 +708,23 @@ function WatchInfoDisplay({ watchEntity }: { watchEntity: Entity }) {
         />
         <span style={{ marginLeft: '10px' }}>{(flickSensitivityTrait?.value ?? 0.0).toFixed(2)}</span>
       </div>
+      <div>
+        Lookahead Delay (ms):
+        <input
+          type="number"
+          value={configurableLookaheadDelayMsTrait?.value ?? 30}
+          onChange={(e) => {
+            const val = parseInt(e.target.value, 10);
+            if (!isNaN(val) && watchEntity) {
+              watchEntity.set(ConfigurableLookaheadDelayMs, { value: Math.max(0, val) }); // Ensure non-negative
+            }
+          }}
+          min="0" // Min 0 for no lookahead
+          max="100" // Sensible max, can be adjusted
+          step="5"
+          style={{ marginLeft: '10px', width: '60px' }}
+        />
+      </div>
     </div>
   );
 }
@@ -671,7 +747,9 @@ function AppContent() {
       ConfigurableThrowWindowMs, 
       ShowDebugLine,             
       ConfigurableThrowStrength, // Add new trait for config
-      FlickSensitivity           // Add new trait for config
+      FlickSensitivity,          // Add new trait for config
+      ConfigurableLookaheadDelayMs, // Add new trait for config
+      IsThrowPending             // Add new trait for managing lookahead state
     );
   }, [worldInstance]);
 
