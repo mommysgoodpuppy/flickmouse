@@ -17,6 +17,7 @@ const ARM_DIRECTION_HISTORY_MAX_AGE_MS = 200; // Max age of samples in history (
 const MIN_THROW_SPEED_THRESHOLD = 5.0;    // Speed (pixels/sec) below which throw stops
 const DEBUG_LINE_VISUAL_SCALE = 0.1;      // Scales potential throw speed to debug line length
 const TAP_ACTION_DEBOUNCE_MS = 100;       // Debounce time for tap/flick actions
+// const CURVE_INTENSITY_FACTOR = 0.1; // Adjust to control curve intensity (rad/s per unit of detected angular speed) - No longer used with ThrowPathPlan
 
 // Updated Friction Constants (from user Step 152)
 const FRICTION_FACTOR_HIGH_SPEED = 1.4;    // Friction factor at high speeds
@@ -35,6 +36,12 @@ const ConfigurableThrowStrength = trait({ value: 500 }); // New trait for throw 
 const FlickSensitivity = trait({ value: 0.0 });          // New trait for flick sensitivity (0.0 to 1.0)
 const ConfigurableLookaheadDelayMs = trait({ value: 30 }); // New trait for lookahead delay
 const IsThrowPending = trait({ value: false });           // True if waiting for lookahead to complete for a throw
+const EnableCurveball = trait({ value: false });          // New trait to toggle curveball throws
+const ThrowPathPlan = trait({
+  segments: [] as { dx: number; dy: number; duration: number }[],
+  currentIndex: 0,
+  activeTimeInSegment: 0, // Time spent in current segment
+});
 
 const IsConnected = trait({ value: false });
 const Hand = trait({ value: null as string | null });
@@ -57,6 +64,7 @@ const MousePosition = trait({ x: 0, y: 0 });
 const MouseVelocity = trait({ x: 0, y: 0 });
 const IsThrown = trait({ value: false });
 const ArmDirectionHistory = trait({ samples: [] as { dx: number; dy: number; timestamp: number }[] });
+const MouseAngularVelocityCurve = trait({ value: 0.0 }); // Angular velocity for curveball throw (rad/s)
 
 export const world = createWorld();
 
@@ -79,6 +87,7 @@ const executeActualThrowLogic = (watchEntity: Entity, tapTimestamp: number) => {
   // For calculating sample window, we re-fetch. This could be passed if strictness is needed.
   const lookaheadDelayMs = watchEntity.get(ConfigurableLookaheadDelayMs)?.value ?? 0; 
   const history = watchEntity.get(ArmDirectionHistory);
+  const enableCurveball = watchEntity.get(EnableCurveball)?.value ?? false;
 
   const historyStartTime = tapTimestamp - configurableThrowWindowMs;
   const historyEndTime = tapTimestamp + lookaheadDelayMs; 
@@ -99,6 +108,7 @@ const executeActualThrowLogic = (watchEntity: Entity, tapTimestamp: number) => {
   let throwDx = 0;
   let throwDy = 0;
 
+  // 1. Determine base throw direction (average or instantaneous)
   if (recentSamples.length > 0) {
     let sumDx = 0;
     let sumDy = 0;
@@ -108,30 +118,69 @@ const executeActualThrowLogic = (watchEntity: Entity, tapTimestamp: number) => {
     }
     throwDx = sumDx / recentSamples.length;
     throwDy = sumDy / recentSamples.length;
-    console.log(`[executeActualThrowLogic] Using averaged history. Raw Dx:${throwDx.toFixed(3)}, Dy:${throwDy.toFixed(3)}`);
+    // console.log(`[executeActualThrowLogic] Base throw from averaged history. Raw Dx:${throwDx.toFixed(3)}, Dy:${throwDy.toFixed(3)}`);
   } else {
     const armDir = watchEntity.get(ArmDirection)?.value;
-    console.log('[executeActualThrowLogic] No history samples in window. Fallback ArmDirection value:', armDir);
+    // console.log('[executeActualThrowLogic] No history samples for base. Fallback ArmDirection value:', armDir);
     if (armDir && typeof armDir.x === 'number' && typeof armDir.y === 'number') {
       throwDx = armDir.x;
       throwDy = armDir.y;
-      console.log(`[executeActualThrowLogic] Using instantaneous ArmDirection. Raw Dx:${throwDx.toFixed(3)}, Dy:${throwDy.toFixed(3)}`);
+      // console.log(`[executeActualThrowLogic] Base throw from instantaneous ArmDirection. Raw Dx:${throwDx.toFixed(3)}, Dy:${throwDy.toFixed(3)}`);
     } else {
-      console.log('[executeActualThrowLogic] No valid arm direction data. Cannot throw.');
-      watchEntity.set(IsThrown, { value: false }); // Ensure it remains not thrown
+      console.log('[executeActualThrowLogic] No valid arm direction data for base throw. Cannot throw.');
+      watchEntity.set(IsThrown, { value: false });
       return; 
     }
   }
 
-  console.log(`[executeActualThrowLogic] Final Raw Vector: Dx:${throwDx.toFixed(3)}, Dy:${throwDy.toFixed(3)}`);
+  // 2. If Curveball enabled, attempt to create and use a ThrowPathPlan
+  if (enableCurveball && recentSamples.length > 0) {
+    const sortedSamples = [...recentSamples].sort((a, b) => a.timestamp - b.timestamp);
+    const pathSegments: { dx: number; dy: number; duration: number }[] = [];
 
-  if (throwDx === 0 && throwDy === 0) {
-      console.log('[executeActualThrowLogic] Calculated throw vector is zero. Mouse remains stationary.');
-      watchEntity.set(IsThrown, { value: false }); 
-      watchEntity.set(MouseVelocity, { x: 0, y: 0 });
-      return;
+    for (let i = 0; i < sortedSamples.length; i++) {
+      const currentSample = sortedSamples[i];
+      const mag = Math.sqrt(currentSample.dx * currentSample.dx + currentSample.dy * currentSample.dy);
+      // Only create segment if there's movement
+      if (mag > 0.001) { 
+        const normDx = currentSample.dx / mag;
+        const normDy = currentSample.dy / mag;
+
+        let duration = 0.05; // Default/min duration for a segment
+        if (i < sortedSamples.length - 1) {
+          const nextSample = sortedSamples[i+1];
+          const timeDiffMs = nextSample.timestamp - currentSample.timestamp;
+          duration = Math.max(0.02, timeDiffMs / 1000.0); // Ensure duration is at least 20ms
+        } else {
+          duration = 0.2; // Last segment has a slightly longer default duration
+        }
+        pathSegments.push({ dx: normDx, dy: normDy, duration });
+      }
+    }
+
+    if (pathSegments.length > 0) {
+      watchEntity.set(ThrowPathPlan, { segments: pathSegments, currentIndex: 0, activeTimeInSegment: 0 });
+      // Override throwDx/Dy with the first segment's normalized direction for the initial impulse
+      throwDx = pathSegments[0].dx;
+      throwDy = pathSegments[0].dy;
+      console.log(`[executeActualThrowLogic] Curveball Path Plan created with ${pathSegments.length} segments. Initial direction: dx=${throwDx.toFixed(2)}, dy=${throwDy.toFixed(2)}`);
+    } else {
+      // Fallback: Curveball enabled, but no valid path segments created (e.g., no movement in samples)
+      // Use the base throwDx, throwDy calculated earlier.
+      watchEntity.set(ThrowPathPlan, { segments: [], currentIndex: 0, activeTimeInSegment: 0 });
+      console.log('[executeActualThrowLogic] Curveball enabled, but Path Plan failed (e.g. no movement in samples). Using base straight direction.');
+    }
+    watchEntity.set(MouseAngularVelocityCurve, { value: 0.0 }); // Ensure old curve logic is off
+
+  } else { // Not enableCurveball, or no recent samples available for curveball path planning
+    // Ensure plan is cleared if not using curveball, or if curveball is on but no samples.
+    watchEntity.set(ThrowPathPlan, { segments: [], currentIndex: 0, activeTimeInSegment: 0 });
+    watchEntity.set(MouseAngularVelocityCurve, { value: 0.0 }); // Clear old curve value
+    // throwDx, throwDy will be the base values calculated above.
+    // console.log('[executeActualThrowLogic] Not using curveball path plan (disabled or no samples). Using base straight direction.');
   }
 
+  // 3. Normalize final throwDx, throwDy for consistent speed application
   const finalVelX = throwDx * currentThrowStrength;
   const finalVelY = throwDy * currentThrowStrength;
 
@@ -327,6 +376,7 @@ function WatchManager({ watchEntity }: { watchEntity: Entity }) {
   const flickSensitivityTrait = useTrait(watchEntity, FlickSensitivity);                // For UI
   const configurableLookaheadDelayMsTrait = useTrait(watchEntity, ConfigurableLookaheadDelayMs); // For UI
   const isThrowPendingTrait = useTrait(watchEntity, IsThrowPending); // For UI debug
+  const enableCurveballTrait = useTrait(watchEntity, EnableCurveball); // For UI
 
   const triggerHaptics = () => {
     if (sdkWatchRef.current && isConnectedValue && hapticsAvailableValue) {
@@ -342,6 +392,19 @@ function WatchManager({ watchEntity }: { watchEntity: Entity }) {
       <button type="button" onClick={triggerHaptics} disabled={!hapticsAvailableValue || !isConnectedValue} style={{ marginTop: '10px' }}>Trigger Haptics</button>
       {/* Debug display for IsThrowPending */}
       { (isThrowPendingTrait?.value) && <div style={{color: 'orange'}}>Throw Pending (Lookahead)...</div> }
+      <div>
+        Enable Curveball Throw:
+        <input
+          type="checkbox"
+          checked={enableCurveballTrait?.value ?? false}
+          onChange={(e) => {
+            if (watchEntity) {
+              watchEntity.set(EnableCurveball, { value: e.target.checked });
+            }
+          }}
+          style={{ marginLeft: '10px' }}
+        />
+      </div>
     </>
   );
 }
@@ -350,6 +413,7 @@ function R3FMouseCursor({ entity }: { entity: Entity }) {
   const meshRef = useRef<THREE.Mesh>(null!); 
   const isThrownStateHook = useTrait(entity, IsThrown); // For reactive color change
   const isCurrentlyThrownForColor = isThrownStateHook ? isThrownStateHook.value : false;
+  const enableCurveball = useTrait(entity, EnableCurveball)?.value ?? false; // Get curveball state
 
   useFrame((_, delta) => {
     if (!meshRef.current || !entity) {
@@ -360,6 +424,8 @@ function R3FMouseCursor({ entity }: { entity: Entity }) {
     const kootaPosition = entity.get(MousePosition);
     const kootaVelocity = entity.get(MouseVelocity); // Snapshot of velocity for this frame's logic
     const isThrownState = entity.get(IsThrown);   // Snapshot of IsThrown for this frame's logic
+    // const angularVelocityCurve = entity.get(MouseAngularVelocityCurve)?.value ?? 0.0; // No longer primary for curve
+    const pathPlanTrait = entity.get(ThrowPathPlan); // Get the whole trait
 
     if (!kootaPosition || !kootaVelocity || !isThrownState) {
       // console.log('[R3FMouseCursor] Missing Koota data, skipping frame.');
@@ -377,6 +443,34 @@ function R3FMouseCursor({ entity }: { entity: Entity }) {
       newKootaY += newKootaVelY * delta;
 
       const currentSpeed = Math.sqrt(newKootaVelX**2 + newKootaVelY**2);
+
+      // Path Following Logic
+      if (enableCurveball && pathPlanTrait && pathPlanTrait.segments.length > 0 && pathPlanTrait.currentIndex < pathPlanTrait.segments.length) {
+        const plan = pathPlanTrait; // Use 'plan' for brevity, Koota will see updates to this reference
+        const segment = plan.segments[plan.currentIndex];
+
+        if (currentSpeed > 0.01) { // Only change direction if moving
+            newKootaVelX = segment.dx * currentSpeed;
+            newKootaVelY = segment.dy * currentSpeed;
+        }
+        // If speed is very low but there's a plan, the initial throw impulse should have set a speed.
+        // If it's caught and re-thrown, executeActualThrowLogic will provide new initial velocity.
+
+        plan.activeTimeInSegment += delta;
+        if (plan.activeTimeInSegment >= segment.duration) {
+          if (plan.currentIndex < plan.segments.length - 1) {
+            plan.currentIndex++;
+            plan.activeTimeInSegment = 0;
+            // console.log(`[R3FMouseCursor] Path plan: Advanced to segment ${plan.currentIndex}`);
+          } else {
+            // On last segment, mouse will continue in this direction
+            // console.log('[R3FMouseCursor] Path plan: On last segment.');
+          }
+        }
+        // Update the Koota trait with the modified plan state for persistence & reactivity
+        entity.set(ThrowPathPlan, { segments: plan.segments, currentIndex: plan.currentIndex, activeTimeInSegment: plan.activeTimeInSegment });
+      }
+      // Old angularVelocityCurve logic is intentionally removed when enableCurveball is true to prioritize path plan
 
       // Dynamic friction calculation
       let dynamicFrictionFactor;
@@ -646,6 +740,7 @@ function WatchInfoDisplay({ watchEntity }: { watchEntity: Entity }) {
   const configurableThrowStrengthTrait = useTrait(watchEntity, ConfigurableThrowStrength); // For UI
   const flickSensitivityTrait = useTrait(watchEntity, FlickSensitivity);                // For UI
   const configurableLookaheadDelayMsTrait = useTrait(watchEntity, ConfigurableLookaheadDelayMs); // For UI
+  const enableCurveballTrait = useTrait(watchEntity, EnableCurveball); // For UI
 
   return (
     <div className="card">
@@ -752,6 +847,19 @@ function WatchInfoDisplay({ watchEntity }: { watchEntity: Entity }) {
           style={{ marginLeft: '10px', width: '60px' }}
         />
       </div>
+      <div>
+        Enable Curveball Throw:
+        <input
+          type="checkbox"
+          checked={enableCurveballTrait?.value ?? false}
+          onChange={(e) => {
+            if (watchEntity) {
+              watchEntity.set(EnableCurveball, { value: e.target.checked });
+            }
+          }}
+          style={{ marginLeft: '10px' }}
+        />
+      </div>
     </div>
   );
 }
@@ -776,7 +884,10 @@ function AppContent() {
       ConfigurableThrowStrength, // Add new trait for config
       FlickSensitivity,          // Add new trait for config
       ConfigurableLookaheadDelayMs, // Add new trait for config
-      IsThrowPending             // Add new trait for managing lookahead state
+      IsThrowPending,             // Add new trait for managing lookahead state
+      EnableCurveball,            // Add new trait for curveball toggle
+      ThrowPathPlan,              // Add new trait for evolving curve throws
+      MouseAngularVelocityCurve   // Add new trait for storing curve parameters
     );
   }, [worldInstance]);
 
