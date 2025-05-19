@@ -4,7 +4,7 @@ import { Watch } from 'touch-sdk';
 import { trait, createWorld, Entity } from 'koota'; 
 import { useTrait, WorldProvider, useWorld } from 'koota/react';
 import { Canvas, useFrame } from '@react-three/fiber';
-import { Edges, OrthographicCamera } from '@react-three/drei'
+import { Edges, OrthographicCamera, Line as DreiLine } from '@react-three/drei'
 import * as THREE from 'three';
 
 interface Vector3 { x: number; y: number; z: number; }
@@ -14,8 +14,17 @@ interface TouchScreenResolution { width: number; height: number; }
 interface GestureProbDetail { [key: string]: number; }
 
 const THROW_SPEED_SCALE = 500;
-const FRICTION_FACTOR = 0.50; 
-const BOUNDARY_PADDING = 100; // Added padding constant
+const ARM_DIRECTION_HISTORY_MAX_AGE_MS = 100; // Max age of samples in history
+const THROW_GESTURE_WINDOW_MS = 30;      // Window to calculate throw direction from
+const MIN_THROW_SPEED_THRESHOLD = 5.0;    // Speed (pixels/sec) below which throw stops
+const DEBUG_LINE_VISUAL_SCALE = 0.1;      // Scales potential throw speed to debug line length
+
+// New Friction Constants
+const FRICTION_FACTOR_HIGH_SPEED = 0.2;    // Friction factor at high speeds
+const FRICTION_FACTOR_LOW_SPEED = 1.5;     // Friction factor at low speeds (stronger stop)
+const FRICTION_TRANSITION_MAX_SPEED = 200.0; // Speed above which high_speed_factor is fully active
+
+const BOUNDARY_PADDING = 50; // Added padding constant
 
 const IsConnected = trait({ value: false });
 const Hand = trait({ value: null as string | null });
@@ -37,6 +46,7 @@ const LastButtonPressTime = trait({ value: null as Date | null });
 const MousePosition = trait({ x: 0, y: 0 });
 const MouseVelocity = trait({ x: 0, y: 0 });
 const IsThrown = trait({ value: false });
+const ArmDirectionHistory = trait({ samples: [] as { dx: number; dy: number; timestamp: number }[] });
 
 export const world = createWorld();
 
@@ -69,20 +79,49 @@ function WatchManager({ watchEntity }: { watchEntity: Entity }) {
       const isThrownTrait = watchEntity.get(IsThrown);
       const currentIsThrown = isThrownTrait ? isThrownTrait.value : false;
 
-      const armDirectionTrait = watchEntity.get(ArmDirection);
-      const armDirectionValue = armDirectionTrait ? armDirectionTrait.value : null;
-
       if (!currentIsThrown) {
-        if (armDirectionValue) {
+        let throwDx = 0;
+        let throwDy = 0;
+        const tapTime = Date.now();
+
+        const historyTrait = watchEntity.get(ArmDirectionHistory);
+        const recentSamples = (historyTrait?.samples || []).filter(
+          sample => tapTime - sample.timestamp <= THROW_GESTURE_WINDOW_MS && tapTime - sample.timestamp >= 0 // ensure samples are not from future if clocks are weird
+        );
+
+        if (recentSamples.length > 0) {
+          let sumDx = 0;
+          let sumDy = 0;
+          for (const sample of recentSamples) {
+            sumDx += sample.dx;
+            sumDy += sample.dy;
+          }
+          throwDx = sumDx / recentSamples.length;
+          throwDy = sumDy / recentSamples.length;
+          console.log(`[TapListener] Using averaged history for throw. Samples in window (${THROW_GESTURE_WINDOW_MS}ms): ${recentSamples.length}. Avg Dx: ${throwDx.toFixed(3)}, Dy: ${throwDy.toFixed(3)}`);
+        }
+        
+        // Fallback to instantaneous if history is insufficient or resulted in zero movement
+        if (throwDx === 0 && throwDy === 0) {
+          const armDirectionTrait = watchEntity.get(ArmDirection);
+          const armDirectionValue = armDirectionTrait ? armDirectionTrait.value : null;
+          if (armDirectionValue) {
+            throwDx = armDirectionValue.x;
+            throwDy = armDirectionValue.y;
+            console.log('[TapListener] Using instantaneous ArmDirection for throw. Dx:', throwDx, 'Dy:', throwDy);
+          }
+        }
+
+        if (throwDx !== 0 || throwDy !== 0) {
           const initialVelocity = {
-            x: armDirectionValue.x * THROW_SPEED_SCALE,
-            y: armDirectionValue.y * THROW_SPEED_SCALE, 
+            x: throwDx * THROW_SPEED_SCALE,
+            y: throwDy * THROW_SPEED_SCALE, 
           };
-          console.log('[TapListener] Attempting to THROW. Arm Dir:', armDirectionValue, 'Initial Velocity:', initialVelocity, 'Current IsThrown:', currentIsThrown);
+          console.log('[TapListener] Attempting to THROW. Final Dir: (', throwDx.toFixed(3), ',', throwDy.toFixed(3), ') Initial Velocity:', initialVelocity);
           watchEntity.set(MouseVelocity, initialVelocity);
           watchEntity.set(IsThrown, { value: true });
         } else {
-          console.log('[TapListener] Attempting to THROW, but currentArmDir is null or undefined. Current IsThrown:', currentIsThrown);
+          console.log('[TapListener] Attempting to THROW, but arm direction is zero (either from history or instantaneous).');
         }
       } else {
         console.log('[TapListener] Attempting to CATCH. Current IsThrown:', currentIsThrown);
@@ -95,6 +134,16 @@ function WatchManager({ watchEntity }: { watchEntity: Entity }) {
     const armDirectionListener = (event: CustomEvent) => {
       const { dx, dy } = event.detail;
       watchEntity.set(ArmDirection, { value: { x: dx, y: dy } });
+
+      const historyTrait = watchEntity.get(ArmDirectionHistory);
+      let currentSamples = historyTrait?.samples ? [...historyTrait.samples] : [];
+
+      currentSamples.push({ dx, dy, timestamp: Date.now() });
+
+      const now = Date.now();
+      currentSamples = currentSamples.filter(sample => now - sample.timestamp <= ARM_DIRECTION_HISTORY_MAX_AGE_MS);
+
+      watchEntity.set(ArmDirectionHistory, { samples: currentSamples });
     };
     const accelerationListener = (event: CustomEvent) => { watchEntity.set(Acceleration, { value: event.detail }); };
     const angularVelocityListener = (event: CustomEvent) => { watchEntity.set(AngularVelocity, { value: event.detail }); };
@@ -160,20 +209,22 @@ function WatchManager({ watchEntity }: { watchEntity: Entity }) {
 }
 
 function R3FMouseCursor({ entity }: { entity: Entity }) {
-  const meshRef = useRef<THREE.Mesh>(null!);
+  const meshRef = useRef<THREE.Mesh>(null!); 
+  const isThrownStateHook = useTrait(entity, IsThrown); // For reactive color change
+  const isCurrentlyThrownForColor = isThrownStateHook ? isThrownStateHook.value : false;
 
   useFrame((_, delta) => {
     if (!meshRef.current || !entity) {
-      console.log('[R3FMouseCursor] Missing refs or Koota, skipping frame.');
+      // console.log('[R3FMouseCursor] Missing refs or Koota, skipping frame.');
       return;
     }
 
     const kootaPosition = entity.get(MousePosition);
-    const kootaVelocity = entity.get(MouseVelocity);
-    const isThrownState = entity.get(IsThrown);
+    const kootaVelocity = entity.get(MouseVelocity); // Snapshot of velocity for this frame's logic
+    const isThrownState = entity.get(IsThrown);   // Snapshot of IsThrown for this frame's logic
 
     if (!kootaPosition || !kootaVelocity || !isThrownState) {
-      console.log('[R3FMouseCursor] Missing Koota data, skipping frame.');
+      // console.log('[R3FMouseCursor] Missing Koota data, skipping frame.');
       return;
     }
     //console.log('[R3FMouseCursor] Frame Start - Koota Pos:', kootaPosition, 'Vel:', kootaVelocity, 'IsThrown:', isThrownState.value);
@@ -183,18 +234,33 @@ function R3FMouseCursor({ entity }: { entity: Entity }) {
     let newKootaVelX = kootaVelocity.x;
     let newKootaVelY = kootaVelocity.y;
 
-    if (isThrownState.value) {
-      //console.log(`[R3FMouseCursor] THROWN: Delta: ${delta.toFixed(4)}, Vel: (${newKootaVelX.toFixed(2)}, ${newKootaVelY.toFixed(2)})`);
+    if (isThrownState.value) { // Only apply physics if currently in "thrown" state
       newKootaX += newKootaVelX * delta;
       newKootaY += newKootaVelY * delta;
 
-      newKootaVelX *= (1 - FRICTION_FACTOR * delta); 
-      newKootaVelY *= (1 - FRICTION_FACTOR * delta);
+      const currentSpeed = Math.sqrt(newKootaVelX**2 + newKootaVelY**2);
 
-      // Stop if velocity is negligible
-      if (Math.abs(newKootaVelX) < 0.01 && Math.abs(newKootaVelY) < 0.01) {
-        //console.log('[R3FMouseCursor] Velocity negligible, stopping throw.');
-        entity.set(IsThrown, { value: false });
+      // Dynamic friction calculation
+      let dynamicFrictionFactor;
+      if (currentSpeed <= MIN_THROW_SPEED_THRESHOLD) { // Should already be caught by speed check below, but defensive
+        dynamicFrictionFactor = FRICTION_FACTOR_LOW_SPEED;
+      } else if (currentSpeed >= FRICTION_TRANSITION_MAX_SPEED) {
+        dynamicFrictionFactor = FRICTION_FACTOR_HIGH_SPEED;
+      } else {
+        // Interpolate between MIN_THROW_SPEED_THRESHOLD and FRICTION_TRANSITION_MAX_SPEED
+        const speedRatio = (currentSpeed - MIN_THROW_SPEED_THRESHOLD) / (FRICTION_TRANSITION_MAX_SPEED - MIN_THROW_SPEED_THRESHOLD);
+        dynamicFrictionFactor = FRICTION_FACTOR_LOW_SPEED + (FRICTION_FACTOR_HIGH_SPEED - FRICTION_FACTOR_LOW_SPEED) * speedRatio;
+      }
+      
+      newKootaVelX *= (1 - dynamicFrictionFactor * delta); 
+      newKootaVelY *= (1 - dynamicFrictionFactor * delta);
+
+      // Check if speed is below threshold to stop the throw
+      // Recalculate speed AFTER applying friction for this frame for the stop check
+      const speedAfterFriction = Math.sqrt(newKootaVelX**2 + newKootaVelY**2);
+      if (speedAfterFriction < MIN_THROW_SPEED_THRESHOLD) {
+        //console.log('[R3FMouseCursor] Speed below threshold, stopping throw. Speed:', currentSpeed.toFixed(2));
+        entity.set(IsThrown, { value: false }); // This will trigger re-render for color change via hook
         newKootaVelX = 0;
         newKootaVelY = 0;
       }
@@ -236,8 +302,99 @@ function R3FMouseCursor({ entity }: { entity: Entity }) {
   return (
     <mesh ref={meshRef} position={[initialMeshX, initialMeshY, 0]}>
       <circleGeometry args={[30, 32]} /> 
-      <meshBasicMaterial color="red" />
+      <meshBasicMaterial color={isCurrentlyThrownForColor ? "red" : "blue"} />
     </mesh>
+  );
+}
+
+function DebugThrowVectorLine({ watchEntity }: { watchEntity: Entity }) {
+  const isThrownState = useTrait(watchEntity, IsThrown);
+  const isCurrentlyThrown = isThrownState ? isThrownState.value : false;
+  const [linePoints, setLinePoints] = useState<[THREE.Vector3, THREE.Vector3]>([
+    new THREE.Vector3(0,0,0.1),
+    new THREE.Vector3(0,0,0.1)
+  ]);
+
+  useFrame(() => {
+    if (!watchEntity) {
+      // If no entity, perhaps ensure linePoints result in no visible line or an empty/default state
+      // For now, if isCurrentlyThrown is true, it will be invisible anyway.
+      return;
+    }
+    if (isCurrentlyThrown) {
+        // Line is hidden by visible prop, no action needed here for points if it shouldn't update when hidden
+        return;
+    }
+    // if (lineRef.current) lineRef.current.visible = true; // Removed ref usage
+
+    let potentialDx = 0;
+    let potentialDy = 0;
+    const tapTime = Date.now();
+    const historyTrait = watchEntity.get(ArmDirectionHistory);
+    const currentArmDir = watchEntity.get(ArmDirection); // For fallback
+
+    const recentSamples = (historyTrait?.samples || []).filter(
+      sample => tapTime - sample.timestamp <= THROW_GESTURE_WINDOW_MS && tapTime - sample.timestamp >= 0
+    );
+
+    if (recentSamples.length > 0) {
+      let sumDx = 0;
+      let sumDy = 0;
+      for (const sample of recentSamples) {
+        sumDx += sample.dx;
+        sumDy += sample.dy;
+      }
+      potentialDx = sumDx / recentSamples.length;
+      potentialDy = sumDy / recentSamples.length;
+    }
+    
+    if ((potentialDx === 0 && potentialDy === 0) && currentArmDir?.value) {
+      potentialDx = currentArmDir.value.x;
+      potentialDy = currentArmDir.value.y;
+    }
+
+    const kootaMousePos = watchEntity.get(MousePosition);
+    if (!kootaMousePos) {
+      // lineRef.current.visible = false; // Removed ref usage
+      return;
+    }
+
+    const startX_r3f = kootaMousePos.x - globalThis.innerWidth / 2;
+    const startY_r3f = -(kootaMousePos.y - globalThis.innerHeight / 2);
+
+    const vecX_r3f = potentialDx * THROW_SPEED_SCALE * DEBUG_LINE_VISUAL_SCALE;
+    const vecY_r3f = -(potentialDy * THROW_SPEED_SCALE * DEBUG_LINE_VISUAL_SCALE); // Y is inverted
+
+    const endX_r3f = startX_r3f + vecX_r3f;
+    const endY_r3f = startY_r3f + vecY_r3f;
+    
+    const points: [THREE.Vector3, THREE.Vector3] = [
+      new THREE.Vector3(startX_r3f, startY_r3f, 0.1),
+      new THREE.Vector3(endX_r3f, endY_r3f, 0.1)
+    ];
+    // if (lineRef.current.geometry) { // No longer needed if DreiLine takes points prop
+    //     lineRef.current.geometry.setFromPoints(points);
+    //     lineRef.current.geometry.attributes.position.needsUpdate = true;
+    // }
+    setLinePoints(points); // Update state for DreiLine points prop
+  });
+
+  // Initialize geometry once - No longer needed with DreiLine points prop
+  // const lineGeom = useMemo(() => new THREE.BufferGeometry().setFromPoints([
+  //   new THREE.Vector3(0,0,0.1), new THREE.Vector3(0,0,0.1)
+  // ]), []);
+
+  return (
+    // <line ref={lineRef} geometry={lineGeom} visible={false}> 
+    //   <lineBasicMaterial color="yellow" />
+    // </line>
+    <DreiLine 
+        // ref={lineRef} // Removed ref
+        points={linePoints} 
+        color="yellow" 
+        lineWidth={3} 
+        visible={!isCurrentlyThrown && !!watchEntity} // Also ensure watchEntity exists for visibility
+    />
   );
 }
 
@@ -282,10 +439,10 @@ export function VirtualMouse({ entity }: { entity: Entity }) {
     >
       <OrthographicCamera 
         makeDefault
-        left={-screenSize.width}
-        right={screenSize.width}
-        top={screenSize.height}
-        bottom={-screenSize.height}
+        left={-screenSize.width / 2} // Corrected
+        right={screenSize.width / 2}  // Corrected
+        top={screenSize.height / 2}   // Corrected
+        bottom={-screenSize.height / 2} // Corrected
         near={1}
         far={1000} 
         position={[0, 0, 10]} 
@@ -294,9 +451,10 @@ export function VirtualMouse({ entity }: { entity: Entity }) {
       <pointLight position={[10, 10, 10]} />
 
       entity && <R3FMouseCursor entity={entity} />
+      entity && <DebugThrowVectorLine watchEntity={entity} />
       {/* Visual Boundary Box */}
       <mesh>
-        <boxGeometry args={[screenSize.width - BOUNDARY_PADDING, screenSize.height - BOUNDARY_PADDING, 0]} /> {/* 20px padding on each side, box depth 0 */}
+        <boxGeometry args={[screenSize.width - 2 * BOUNDARY_PADDING, screenSize.height - 2 * BOUNDARY_PADDING, 0]} /> 
         <meshBasicMaterial opacity={0} transparent />
         <Edges color="cyan" lineWidth={10} />
       </mesh>
@@ -362,7 +520,8 @@ function AppContent() {
       GravityVector, Orientation, TouchPosition, LastTouchEvent, RotaryStep, LastButtonPressTime,
       MousePosition({ x: globalThis.innerWidth / 2, y: globalThis.innerHeight / 2 }), 
       MouseVelocity, 
-      IsThrown 
+      IsThrown,
+      ArmDirectionHistory // Add new trait here
     );
   }, [worldInstance]);
 
