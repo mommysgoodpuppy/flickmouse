@@ -1,20 +1,21 @@
 {
   "version": "5",
   "specifiers": {
-    "npm:@deno/vite-plugin@^1.0.4": "1.0.4_vite@6.3.5__picomatch@4.0.2",
+    "npm:@deno/vite-plugin@^1.0.4": "1.0.4_vite@6.3.5__picomatch@4.0.2_@types+node@22.15.15",
     "npm:@react-three/drei@^10.0.8": "10.0.8_@react-three+fiber@9.1.2__react@19.1.0__react-dom@19.1.0___react@19.1.0__three@0.176.0__@types+react@19.1.4__use-sync-external-store@1.5.0___react@19.1.0_react@19.1.0_react-dom@19.1.0__react@19.1.0_three@0.176.0_@types+three@0.176.0_@types+react@19.1.4_use-sync-external-store@1.5.0__react@19.1.0",
     "npm:@react-three/fiber@^9.1.2": "9.1.2_react@19.1.0_react-dom@19.1.0__react@19.1.0_three@0.176.0_@types+react@19.1.4_use-sync-external-store@1.5.0__react@19.1.0",
+    "npm:@types/node@*": "22.15.15",
     "npm:@types/react-dom@^19.0.4": "19.1.5_@types+react@19.1.4",
     "npm:@types/react@^19.0.10": "19.1.4",
     "npm:@types/three@0.176": "0.176.0",
-    "npm:@vitejs/plugin-react@^4.3.4": "4.4.1_vite@6.3.5__picomatch@4.0.2_@babel+core@7.27.1",
+    "npm:@vitejs/plugin-react@^4.3.4": "4.4.1_vite@6.3.5__picomatch@4.0.2_@babel+core@7.27.1_@types+node@22.15.15",
     "npm:koota@~0.4.1": "0.4.1_@types+react@19.1.4_react@19.1.0",
     "npm:react-dom@19": "19.1.0_react@19.1.0",
     "npm:react@19": "19.1.0",
     "npm:three@0.176": "0.176.0",
     "npm:touch-sdk@~0.6.1": "0.6.1",
-    "npm:vite@*": "6.3.5_picomatch@4.0.2",
-    "npm:vite@^6.1.1": "6.3.5_picomatch@4.0.2"
+    "npm:vite@*": "6.3.5_picomatch@4.0.2_@types+node@22.15.15",
+    "npm:vite@^6.1.1": "6.3.5_picomatch@4.0.2_@types+node@22.15.15"
   },
   "npm": {
     "@ampproject/remapping@2.3.0": {
@@ -164,7 +165,13 @@
     "@deno/vite-plugin@1.0.4_vite@6.3.5__picomatch@4.0.2": {
       "integrity": "sha512-xg8YT8Wn2sGXSnJgiGTpBGX1Dov0c6fd1rAp8VsfrCUtyBRRWzwVMAnd3fQ4yq8h7LSVvJUxEFN4U421k/DQLA==",
       "dependencies": [
-        "vite"
+        "vite@6.3.5_picomatch@4.0.2"
+      ]
+    },
+    "@deno/vite-plugin@1.0.4_vite@6.3.5__picomatch@4.0.2_@types+node@22.15.15": {
+      "integrity": "sha512-xg8YT8Wn2sGXSnJgiGTpBGX1Dov0c6fd1rAp8VsfrCUtyBRRWzwVMAnd3fQ4yq8h7LSVvJUxEFN4U421k/DQLA==",
+      "dependencies": [
+        "vite@6.3.5_picomatch@4.0.2_@types+node@22.15.15"
       ]
     },
     "@dimforge/rapier3d-compat@0.12.0": {
@@ -557,6 +564,12 @@
     "@types/estree@1.0.7": {
       "integrity": "sha512-w28IoSUCJpidD/TGviZwwMJckNESJZXFu7NBZ5YJ4mEUnNraUn9Pm8HSZm/jDF1pDWYKspWE7oVphigUPRakIQ=="
     },
+    "@types/node@22.15.15": {
+      "integrity": "sha512-R5muMcZob3/Jjchn5LcO8jdKwSCbzqmPB6ruBxMcf9kbxtniZHP327s6C37iOfuw8mbKK3cAQa7sEl7afLrQ8A==",
+      "dependencies": [
+        "undici-types"
+      ]
+    },
     "@types/node@22.15.19": {
       "integrity": "sha512-3vMNr4TzNQyjHcRZadojpRaD9Ofr6LsonZAoQ+HMUa/9ORTPoxVIw0e0mpqWpdjj8xybyCM+oKOUH2vwFu/oEw==",
       "dependencies": [
@@ -620,7 +633,18 @@
         "@babel/plugin-transform-react-jsx-source",
         "@types/babel__core",
         "react-refresh",
-        "vite"
+        "vite@6.3.5_picomatch@4.0.2"
+      ]
+    },
+    "@vitejs/plugin-react@4.4.1_vite@6.3.5__picomatch@4.0.2_@babel+core@7.27.1_@types+node@22.15.15": {
+      "integrity": "sha512-IpEm5ZmeXAP/osiBXVVP5KjFMzbWOonMs0NaQQl+xYnUAcq4oHUBsF2+p4MgKWG4YMmFYJU8A6sxRPuowllm6w==",
+      "dependencies": [
+        "@babel/core",
+        "@babel/plugin-transform-react-jsx-self",
+        "@babel/plugin-transform-react-jsx-source",
+        "@types/babel__core",
+        "react-refresh",
+        "vite@6.3.5_picomatch@4.0.2_@types+node@22.15.15"
       ]
     },
     "@webgpu/types@0.1.60": {
@@ -889,7 +913,7 @@
         "@protobufjs/path",
         "@protobufjs/pool",
         "@protobufjs/utf8",
-        "@types/node",
+        "@types/node@22.15.19",
         "long"
       ],
       "scripts": true
@@ -1092,6 +1116,25 @@
       ],
       "optionalDependencies": [
         "fsevents"
+      ],
+      "bin": true
+    },
+    "vite@6.3.5_picomatch@4.0.2_@types+node@22.15.15": {
+      "integrity": "sha512-cZn6NDFE7wdTpINgs++ZJ4N49W2vRp8LCKrn3Ob1kYNtOo21vfDoaV5GzBfLU4MovSAB8uNRm4jgzVQZ+mBzPQ==",
+      "dependencies": [
+        "@types/node@22.15.15",
+        "esbuild",
+        "fdir",
+        "picomatch",
+        "postcss",
+        "rollup",
+        "tinyglobby"
+      ],
+      "optionalDependencies": [
+        "fsevents"
+      ],
+      "optionalPeers": [
+        "@types/node@22.15.15"
       ],
       "bin": true
     },

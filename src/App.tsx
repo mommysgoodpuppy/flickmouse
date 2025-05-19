@@ -24,6 +24,8 @@ const FRICTION_FACTOR_LOW_SPEED = 6.0;     // Friction factor at low speeds (str
 const FRICTION_TRANSITION_MAX_SPEED = 300.0; // Speed above which high_speed_factor is fully active
 
 const FLICK_SENSITIVITY_EXPONENT = 3.0;   // Makes flick sensitivity slider more responsive at high values
+const FLICK_SENSITIVITY_UI_QUADRATIC_A = -1.8; // Coefficient for s_ui^2
+const FLICK_SENSITIVITY_UI_QUADRATIC_B = 2.8;  // Coefficient for s_ui
 const BOUNDARY_PADDING = 50; // Added padding constant
 
 // Koota traits for configuration
@@ -233,15 +235,22 @@ function WatchManager({ watchEntity }: { watchEntity: Entity }) {
       watchEntity.set(GestureProb, { value: gestureProb });
 
       // Flick-tap detection based on probability
-      const currentFlickSensitivity = watchEntity.get(FlickSensitivity)?.value ?? 0;
-      if (currentFlickSensitivity > 0) { // Only apply flick logic if sensitivity is non-zero
+      const currentFlickSensitivityUI = watchEntity.get(FlickSensitivity)?.value ?? 0;
+      if (currentFlickSensitivityUI > 0) { // Only apply flick logic if sensitivity is non-zero
         const tapProbability = gestureProb?.tap ?? 0;
-        // Apply exponential curve to sensitivity for threshold calculation
+        
+        // Apply quadratic mapping to UI sensitivity
+        // s_internal = a * s_ui^2 + b * s_ui
+        // Values chosen so s_ui=0 -> s_internal=0, s_ui=0.5 -> s_internal=0.95, s_ui=1 -> s_internal=1
+        const flickSensitivityInternal = (FLICK_SENSITIVITY_UI_QUADRATIC_A * Math.pow(currentFlickSensitivityUI, 2)) + (FLICK_SENSITIVITY_UI_QUADRATIC_B * currentFlickSensitivityUI);
+        // Clamp internal sensitivity to [0, 1] just in case coefficients produce out-of-range values
+        const clampedFlickSensitivityInternal = Math.max(0, Math.min(1, flickSensitivityInternal));
+
         // Threshold goes from 1 (sens=0) down to 0 (sens=1)
-        const probabilityThreshold = Math.pow(1.0 - currentFlickSensitivity, FLICK_SENSITIVITY_EXPONENT);
+        const probabilityThreshold = Math.pow(1.0 - clampedFlickSensitivityInternal, FLICK_SENSITIVITY_EXPONENT);
         
         if (tapProbability >= probabilityThreshold) { 
-          console.log(`[WatchManager] Flick-tap detected! Prob: ${tapProbability.toFixed(3)} >= Thresh: ${probabilityThreshold.toFixed(5)} (Raw Sens: ${currentFlickSensitivity.toFixed(2)}, Exp: ${FLICK_SENSITIVITY_EXPONENT})`);
+          console.log(`[WatchManager] Flick-tap detected! Prob: ${tapProbability.toFixed(3)} >= Thresh: ${probabilityThreshold.toFixed(5)} (UI Sens: ${currentFlickSensitivityUI.toFixed(2)}, Internal Sens: ${clampedFlickSensitivityInternal.toFixed(2)}, Exp: ${FLICK_SENSITIVITY_EXPONENT})`);
           performThrowOrCatchAction(watchEntity);
         }
       }
@@ -440,12 +449,11 @@ function DebugThrowVectorLine({ watchEntity }: { watchEntity: Entity }) {
   const isThrownState = useTrait(watchEntity, IsThrown);
   const isCurrentlyThrown = isThrownState ? isThrownState.value : false;
   
-  // Get configurable settings from Koota traits
   const configurableThrowWindow = useTrait(watchEntity, ConfigurableThrowWindowMs)?.value ?? 50;
   const showDebugLineSetting = useTrait(watchEntity, ShowDebugLine)?.value ?? false;
   const currentThrowStrength = useTrait(watchEntity, ConfigurableThrowStrength)?.value ?? 500;
 
-  const [linePoints, setLinePoints] = useState<[THREE.Vector3, THREE.Vector3]>([
+  const [linePoints, setLinePoints] = useState<THREE.Vector3[]>([
     new THREE.Vector3(0,0,0.1),
     new THREE.Vector3(0,0,0.1)
   ]);
@@ -454,78 +462,97 @@ function DebugThrowVectorLine({ watchEntity }: { watchEntity: Entity }) {
     if (!watchEntity) {
       return;
     }
-    // Visibility is handled by the visible prop on DreiLine based on showDebugLineSetting & isCurrentlyThrown
     if (!showDebugLineSetting || isCurrentlyThrown) {
+        // If not showing debug line or if mouse is thrown, ensure points are minimal to avoid rendering old line
+        if (linePoints.length > 2 || linePoints[0].x !== 0 || linePoints[1].x !== 0) {
+             setLinePoints([new THREE.Vector3(0,0,0.1), new THREE.Vector3(0,0,0.1)]);
+        }
         return;
-    }
-
-    let potentialDx = 0;
-    let potentialDy = 0;
-    const tapTime = Date.now();
-    const historyTrait = watchEntity.get(ArmDirectionHistory);
-    const currentArmDir = watchEntity.get(ArmDirection); 
-
-    const recentSamples = (historyTrait?.samples || []).filter(
-      sample => tapTime - sample.timestamp <= (configurableThrowWindow) && tapTime - sample.timestamp >= 0 // configurableThrowWindow already has ?? 50
-    );
-
-    if (recentSamples.length > 0) {
-      let sumDx = 0;
-      let sumDy = 0;
-      for (const sample of recentSamples) {
-        sumDx += sample.dx;
-        sumDy += sample.dy;
-      }
-      potentialDx = sumDx / recentSamples.length;
-      potentialDy = sumDy / recentSamples.length;
-    }
-    
-    if ((potentialDx === 0 && potentialDy === 0) && currentArmDir?.value) {
-      potentialDx = currentArmDir.value.x;
-      potentialDy = currentArmDir.value.y;
     }
 
     const kootaMousePos = watchEntity.get(MousePosition);
     if (!kootaMousePos) {
-      // lineRef.current.visible = false; // Removed ref usage
       return;
     }
 
     const startX_r3f = kootaMousePos.x - globalThis.innerWidth / 2;
     const startY_r3f = -(kootaMousePos.y - globalThis.innerHeight / 2);
+    const startPoint = new THREE.Vector3(startX_r3f, startY_r3f, 0.1);
+    const points: THREE.Vector3[] = [startPoint];
 
-    const vecX_r3f = potentialDx * currentThrowStrength * DEBUG_LINE_VISUAL_SCALE;
-    const vecY_r3f = -(potentialDy * currentThrowStrength * DEBUG_LINE_VISUAL_SCALE); // Y is inverted
+    const historyTrait = watchEntity.get(ArmDirectionHistory);
+    const lookaheadDelayMs = watchEntity.get(ConfigurableLookaheadDelayMs)?.value ?? 0; // Get lookahead
+    const tapTime = Date.now(); // Use current time for filtering samples relative to now
 
-    const endX_r3f = startX_r3f + vecX_r3f;
-    const endY_r3f = startY_r3f + vecY_r3f;
+    // Filter samples considering throw window and lookahead
+    // Samples should be WITHIN [tapTime - throwWindow, tapTime + lookaheadDelay]
+    // For debug line, we are predicting a throw *now*, so we use tapTime as the reference.
+    const historyStartTime = tapTime - configurableThrowWindow;
+    const historyEndTime = tapTime + lookaheadDelayMs;
+
+    const samplesToUse = (historyTrait?.samples || []).filter(
+      sample => sample.timestamp >= historyStartTime && sample.timestamp <= historyEndTime
+    );
     
-    const points: [THREE.Vector3, THREE.Vector3] = [
-      new THREE.Vector3(startX_r3f, startY_r3f, 0.1),
-      new THREE.Vector3(endX_r3f, endY_r3f, 0.1)
-    ];
-    // if (lineRef.current.geometry) { // No longer needed if DreiLine takes points prop
-    //     lineRef.current.geometry.setFromPoints(points);
-    //     lineRef.current.geometry.attributes.position.needsUpdate = true;
-    // }
-    setLinePoints(points); // Update state for DreiLine points prop
+    // Sort samples by timestamp to build the curve chronologically
+    samplesToUse.sort((a, b) => a.timestamp - b.timestamp);
+
+    if (samplesToUse.length > 0) {
+      let currentX = startX_r3f;
+      let currentY = startY_r3f;
+      // Use a smaller scale factor per segment if there are many samples to avoid overly long lines
+      // Or, we can average them as before for the *total* vector, but draw segments based on individual samples
+      // For drawing a curve, we'll use individual sample directions sequentially.
+      const numSamples = samplesToUse.length;
+      const perSampleScale = DEBUG_LINE_VISUAL_SCALE / (numSamples > 1 ? Math.sqrt(numSamples) : 1); // Dampen effect of many small jitters
+
+      for (const sample of samplesToUse) {
+        const dx = sample.dx;
+        const dy = sample.dy;
+
+        // Scale each segment. Strength applied at the end of chain or averaged?
+        // For visualization, direct scaling of each segment is simpler to show path.
+        const vecX_r3f_segment = dx * currentThrowStrength * perSampleScale; 
+        const vecY_r3f_segment = -(dy * currentThrowStrength * perSampleScale); // Y is inverted
+        
+        currentX += vecX_r3f_segment;
+        currentY += vecY_r3f_segment;
+        points.push(new THREE.Vector3(currentX, currentY, 0.1));
+      }
+      if (points.length === 1) { // Only start point was added, means no valid samples processed
+          // Fallback to instantaneous arm direction if no history points were generated
+          const currentArmDir = watchEntity.get(ArmDirection);
+          if (currentArmDir?.value) {
+            const vecX_r3f = currentArmDir.value.x * currentThrowStrength * DEBUG_LINE_VISUAL_SCALE;
+            const vecY_r3f = -(currentArmDir.value.y * currentThrowStrength * DEBUG_LINE_VISUAL_SCALE);
+            points.push(new THREE.Vector3(startX_r3f + vecX_r3f, startY_r3f + vecY_r3f, 0.1));
+          } else {
+            points.push(new THREE.Vector3(startX_r3f, startY_r3f, 0.1)); // Duplicate start if no arm dir
+          }
+      }
+    } else {
+      // Fallback to instantaneous arm direction if no history samples at all
+      const currentArmDir = watchEntity.get(ArmDirection);
+      let potentialDx = 0;
+      let potentialDy = 0;
+      if (currentArmDir?.value) {
+        potentialDx = currentArmDir.value.x;
+        potentialDy = currentArmDir.value.y;
+      }
+      const vecX_r3f = potentialDx * currentThrowStrength * DEBUG_LINE_VISUAL_SCALE;
+      const vecY_r3f = -(potentialDy * currentThrowStrength * DEBUG_LINE_VISUAL_SCALE); // Y is inverted
+      points.push(new THREE.Vector3(startX_r3f + vecX_r3f, startY_r3f + vecY_r3f, 0.1));
+    }
+    
+    setLinePoints(points);
   });
 
-  // Initialize geometry once - No longer needed with DreiLine points prop
-  // const lineGeom = useMemo(() => new THREE.BufferGeometry().setFromPoints([
-  //   new THREE.Vector3(0,0,0.1), new THREE.Vector3(0,0,0.1)
-  // ]), []);
-
   return (
-    // <line ref={lineRef} geometry={lineGeom} visible={false}> 
-    //   <lineBasicMaterial color="yellow" />
-    // </line>
     <DreiLine 
-        // ref={lineRef} // Removed ref
         points={linePoints} 
         color="yellow" 
         lineWidth={3} 
-        visible={showDebugLineSetting && !isCurrentlyThrown && !!watchEntity} 
+        visible={showDebugLineSetting && !isCurrentlyThrown && !!watchEntity && linePoints.length > 1}
     />
   );
 }
