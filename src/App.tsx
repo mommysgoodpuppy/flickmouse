@@ -23,6 +23,7 @@ const FRICTION_FACTOR_HIGH_SPEED = 1.4;    // Friction factor at high speeds
 const FRICTION_FACTOR_LOW_SPEED = 6.0;     // Friction factor at low speeds (stronger stop)
 const FRICTION_TRANSITION_MAX_SPEED = 300.0; // Speed above which high_speed_factor is fully active
 
+const FLICK_SENSITIVITY_EXPONENT = 3.0;   // Makes flick sensitivity slider more responsive at high values
 const BOUNDARY_PADDING = 50; // Added padding constant
 
 // Koota traits for configuration
@@ -180,11 +181,14 @@ function WatchManager({ watchEntity }: { watchEntity: Entity }) {
 
       // Flick-tap detection based on probability
       const currentFlickSensitivity = watchEntity.get(FlickSensitivity)?.value ?? 0;
-      if (currentFlickSensitivity > 0) {
+      if (currentFlickSensitivity > 0) { // Only apply flick logic if sensitivity is non-zero
         const tapProbability = gestureProb?.tap ?? 0;
-        const probabilityThreshold = 1.0 - currentFlickSensitivity;
-        if (tapProbability > probabilityThreshold) {
-          console.log(`[WatchManager] Flick-tap detected! Prob: ${tapProbability.toFixed(3)} > Thresh: ${probabilityThreshold.toFixed(3)} (Sensitivity: ${currentFlickSensitivity.toFixed(2)})`);
+        // Apply exponential curve to sensitivity for threshold calculation
+        // Threshold goes from 1 (sens=0) down to 0 (sens=1)
+        const probabilityThreshold = Math.pow(1.0 - currentFlickSensitivity, FLICK_SENSITIVITY_EXPONENT);
+        
+        if (tapProbability >= probabilityThreshold) { 
+          console.log(`[WatchManager] Flick-tap detected! Prob: ${tapProbability.toFixed(3)} >= Thresh: ${probabilityThreshold.toFixed(5)} (Raw Sens: ${currentFlickSensitivity.toFixed(2)}, Exp: ${FLICK_SENSITIVITY_EXPONENT})`);
           performThrowOrCatchAction(watchEntity);
         }
       }
@@ -639,7 +643,7 @@ function WatchInfoDisplay({ watchEntity }: { watchEntity: Entity }) {
             }
           }}
           min="0.0"
-          max="1" // Max 0.95 to avoid threshold of 0.05, which might be too sensitive
+          max="1" // Max 1.0 allows threshold to be 0.0 (triggers on any tap probability)
           step="0.05"
           style={{ marginLeft: '10px', width: '150px', verticalAlign: 'middle' }}
         />
