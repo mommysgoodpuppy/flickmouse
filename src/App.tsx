@@ -15,16 +15,20 @@ interface GestureProbDetail { [key: string]: number; }
 
 const THROW_SPEED_SCALE = 500;
 const ARM_DIRECTION_HISTORY_MAX_AGE_MS = 100; // Max age of samples in history
-const THROW_GESTURE_WINDOW_MS = 30;      // Window to calculate throw direction from
+// const THROW_GESTURE_WINDOW_MS = 50; // Removed, will be a Koota trait
 const MIN_THROW_SPEED_THRESHOLD = 5.0;    // Speed (pixels/sec) below which throw stops
 const DEBUG_LINE_VISUAL_SCALE = 0.1;      // Scales potential throw speed to debug line length
 
-// New Friction Constants
-const FRICTION_FACTOR_HIGH_SPEED = 0.2;    // Friction factor at high speeds
-const FRICTION_FACTOR_LOW_SPEED = 1.5;     // Friction factor at low speeds (stronger stop)
-const FRICTION_TRANSITION_MAX_SPEED = 200.0; // Speed above which high_speed_factor is fully active
+// New Friction Constants - Doubled
+const FRICTION_FACTOR_HIGH_SPEED = 1.4;    // Friction factor at high speeds (was 0.2)
+const FRICTION_FACTOR_LOW_SPEED = 6.0;     // Friction factor at low speeds (stronger stop) (was 1.5)
+const FRICTION_TRANSITION_MAX_SPEED = 300.0; // Speed above which high_speed_factor is fully active
 
 const BOUNDARY_PADDING = 50; // Added padding constant
+
+// New Koota traits for configuration
+const ConfigurableThrowWindowMs = trait({ value: 50 }); // Default based on user's last setting
+const ShowDebugLine = trait({ value: false }); // Default to false
 
 const IsConnected = trait({ value: false });
 const Hand = trait({ value: null as string | null });
@@ -86,7 +90,7 @@ function WatchManager({ watchEntity }: { watchEntity: Entity }) {
 
         const historyTrait = watchEntity.get(ArmDirectionHistory);
         const recentSamples = (historyTrait?.samples || []).filter(
-          sample => tapTime - sample.timestamp <= THROW_GESTURE_WINDOW_MS && tapTime - sample.timestamp >= 0 // ensure samples are not from future if clocks are weird
+          sample => tapTime - sample.timestamp <= (watchEntity.get(ConfigurableThrowWindowMs)?.value ?? 50) && tapTime - sample.timestamp >= 0 // ensure samples are not from future if clocks are weird
         );
 
         if (recentSamples.length > 0) {
@@ -98,7 +102,7 @@ function WatchManager({ watchEntity }: { watchEntity: Entity }) {
           }
           throwDx = sumDx / recentSamples.length;
           throwDy = sumDy / recentSamples.length;
-          console.log(`[TapListener] Using averaged history for throw. Samples in window (${THROW_GESTURE_WINDOW_MS}ms): ${recentSamples.length}. Avg Dx: ${throwDx.toFixed(3)}, Dy: ${throwDy.toFixed(3)}`);
+          console.log(`[TapListener] Using averaged history for throw. Samples in window (${(watchEntity.get(ConfigurableThrowWindowMs)?.value ?? 50)}ms): ${recentSamples.length}. Avg Dx: ${throwDx.toFixed(3)}, Dy: ${throwDy.toFixed(3)}`);
         }
         
         // Fallback to instantaneous if history is insufficient or resulted in zero movement
@@ -310,6 +314,11 @@ function R3FMouseCursor({ entity }: { entity: Entity }) {
 function DebugThrowVectorLine({ watchEntity }: { watchEntity: Entity }) {
   const isThrownState = useTrait(watchEntity, IsThrown);
   const isCurrentlyThrown = isThrownState ? isThrownState.value : false;
+  
+  // Get configurable settings from Koota traits
+  const configurableThrowWindow = useTrait(watchEntity, ConfigurableThrowWindowMs)?.value ?? 50;
+  const showDebugLineSetting = useTrait(watchEntity, ShowDebugLine)?.value ?? false;
+
   const [linePoints, setLinePoints] = useState<[THREE.Vector3, THREE.Vector3]>([
     new THREE.Vector3(0,0,0.1),
     new THREE.Vector3(0,0,0.1)
@@ -317,24 +326,21 @@ function DebugThrowVectorLine({ watchEntity }: { watchEntity: Entity }) {
 
   useFrame(() => {
     if (!watchEntity) {
-      // If no entity, perhaps ensure linePoints result in no visible line or an empty/default state
-      // For now, if isCurrentlyThrown is true, it will be invisible anyway.
       return;
     }
-    if (isCurrentlyThrown) {
-        // Line is hidden by visible prop, no action needed here for points if it shouldn't update when hidden
+    // Visibility is handled by the visible prop on DreiLine based on showDebugLineSetting & isCurrentlyThrown
+    if (!showDebugLineSetting || isCurrentlyThrown) {
         return;
     }
-    // if (lineRef.current) lineRef.current.visible = true; // Removed ref usage
 
     let potentialDx = 0;
     let potentialDy = 0;
     const tapTime = Date.now();
     const historyTrait = watchEntity.get(ArmDirectionHistory);
-    const currentArmDir = watchEntity.get(ArmDirection); // For fallback
+    const currentArmDir = watchEntity.get(ArmDirection); 
 
     const recentSamples = (historyTrait?.samples || []).filter(
-      sample => tapTime - sample.timestamp <= THROW_GESTURE_WINDOW_MS && tapTime - sample.timestamp >= 0
+      sample => tapTime - sample.timestamp <= (configurableThrowWindow) && tapTime - sample.timestamp >= 0 // configurableThrowWindow already has ?? 50
     );
 
     if (recentSamples.length > 0) {
@@ -393,7 +399,7 @@ function DebugThrowVectorLine({ watchEntity }: { watchEntity: Entity }) {
         points={linePoints} 
         color="yellow" 
         lineWidth={3} 
-        visible={!isCurrentlyThrown && !!watchEntity} // Also ensure watchEntity exists for visibility
+        visible={showDebugLineSetting && !isCurrentlyThrown && !!watchEntity} 
     />
   );
 }
@@ -481,6 +487,10 @@ function WatchInfoDisplay({ watchEntity }: { watchEntity: Entity }) {
   const rotaryStep = useTrait(watchEntity, RotaryStep)?.value;
   const lastButtonPress = useTrait(watchEntity, LastButtonPressTime)?.value;
 
+  // Get new configurable traits for UI
+  const configurableThrowWindowMsTrait = useTrait(watchEntity, ConfigurableThrowWindowMs);
+  const showDebugLineTrait = useTrait(watchEntity, ShowDebugLine);
+
   return (
     <div className="card">
       <div>Status: {isConnected ? 'Connected' : 'Disconnected'}</div>
@@ -503,6 +513,37 @@ function WatchInfoDisplay({ watchEntity }: { watchEntity: Entity }) {
       <div>Last Touch Event: {lastTouchEvent ?? 'N/A'} {touchPosition ? `(x: ${touchPosition.x}, y: ${touchPosition.y})` : ''}</div>
       <div>Rotary Step: {rotaryStep === null ? 'N/A' : rotaryStep}</div>
       <div>Last Button Press: {lastButtonPress ? lastButtonPress.toLocaleTimeString() : 'N/A'}</div>
+      
+      <h3>Settings:</h3>
+      <div>
+        Throw Gesture Window (ms):
+        <input
+          type="number"
+          value={configurableThrowWindowMsTrait?.value ?? 50}
+          onChange={(e) => {
+            const val = parseInt(e.target.value, 10);
+            if (!isNaN(val) && watchEntity) {
+              watchEntity.set(ConfigurableThrowWindowMs, { value: val });
+            }
+          }}
+          min="0"
+          step="10"
+          style={{ marginLeft: '10px', width: '60px' }}
+        />
+      </div>
+      <div>
+        Show Debug Throw Line:
+        <input
+          type="checkbox"
+          checked={showDebugLineTrait?.value ?? false}
+          onChange={(e) => {
+            if (watchEntity) {
+              watchEntity.set(ShowDebugLine, { value: e.target.checked });
+            }
+          }}
+          style={{ marginLeft: '10px' }}
+        />
+      </div>
     </div>
   );
 }
@@ -511,7 +552,7 @@ function AppContent() {
   const worldInstance = useWorld();
 
   const watchEntity = useMemo(() => {
-    const existing = worldInstance.query(IsConnected, Hand, MousePosition); 
+    const existing = worldInstance.query(IsConnected, Hand, MousePosition); // Keep query simple
     if (existing.length > 0) return existing[0];
     
     return worldInstance.spawn(
@@ -521,26 +562,36 @@ function AppContent() {
       MousePosition({ x: globalThis.innerWidth / 2, y: globalThis.innerHeight / 2 }), 
       MouseVelocity, 
       IsThrown,
-      ArmDirectionHistory // Add new trait here
+      ArmDirectionHistory,
+      ConfigurableThrowWindowMs, // Add new trait for config
+      ShowDebugLine              // Add new trait for config
     );
   }, [worldInstance]);
+
+  useEffect(() => {
+    // Initialize mouse position if it's the first run and entity is newly spawned
+    if (watchEntity && watchEntity.get(MousePosition)?.x === 0 && watchEntity.get(MousePosition)?.y === 0) {
+        watchEntity.set(MousePosition, { x: globalThis.innerWidth / 2, y: globalThis.innerHeight / 2 });
+    }
+  }, [watchEntity]);
+
+
+  // Ensure watchEntity is passed to components that need it
+  if (!watchEntity) return <div>Loading watch entity...</div>;
 
   return (
     <>
       <WatchManager watchEntity={watchEntity} />
-      <VirtualMouse entity={watchEntity} /> 
-      <h2>Touch SDK Watch Info</h2>
-      <WatchInfoDisplay watchEntity={watchEntity} />
+      <VirtualMouse entity={watchEntity} />
+      <WatchInfoDisplay watchEntity={watchEntity} /> 
     </>
   );
 }
 
-function App() {
+export default function App() {
   return (
     <WorldProvider world={world}>
       <AppContent />
     </WorldProvider>
   );
 }
-
-export default App;
