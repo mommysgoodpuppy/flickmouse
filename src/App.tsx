@@ -13,22 +13,23 @@ interface Vector2 { x: number; y: number; }
 interface TouchScreenResolution { width: number; height: number; }
 interface GestureProbDetail { [key: string]: number; }
 
-const THROW_SPEED_SCALE = 500;
 const ARM_DIRECTION_HISTORY_MAX_AGE_MS = 100; // Max age of samples in history
-// const THROW_GESTURE_WINDOW_MS = 50; // Removed, will be a Koota trait
 const MIN_THROW_SPEED_THRESHOLD = 5.0;    // Speed (pixels/sec) below which throw stops
 const DEBUG_LINE_VISUAL_SCALE = 0.1;      // Scales potential throw speed to debug line length
+const TAP_ACTION_DEBOUNCE_MS = 100;       // Debounce time for tap/flick actions
 
-// New Friction Constants - Doubled
-const FRICTION_FACTOR_HIGH_SPEED = 1.4;    // Friction factor at high speeds (was 0.2)
-const FRICTION_FACTOR_LOW_SPEED = 6.0;     // Friction factor at low speeds (stronger stop) (was 1.5)
+// Updated Friction Constants (from user Step 152)
+const FRICTION_FACTOR_HIGH_SPEED = 1.4;    // Friction factor at high speeds
+const FRICTION_FACTOR_LOW_SPEED = 6.0;     // Friction factor at low speeds (stronger stop)
 const FRICTION_TRANSITION_MAX_SPEED = 300.0; // Speed above which high_speed_factor is fully active
 
 const BOUNDARY_PADDING = 50; // Added padding constant
 
-// New Koota traits for configuration
-const ConfigurableThrowWindowMs = trait({ value: 50 }); // Default based on user's last setting
-const ShowDebugLine = trait({ value: false }); // Default to false
+// Koota traits for configuration
+const ConfigurableThrowWindowMs = trait({ value: 50 }); 
+const ShowDebugLine = trait({ value: false }); 
+const ConfigurableThrowStrength = trait({ value: 500 }); // New trait for throw strength
+const FlickSensitivity = trait({ value: 0.0 });          // New trait for flick sensitivity (0.0 to 1.0)
 
 const IsConnected = trait({ value: false });
 const Hand = trait({ value: null as string | null });
@@ -54,151 +55,213 @@ const ArmDirectionHistory = trait({ samples: [] as { dx: number; dy: number; tim
 
 export const world = createWorld();
 
+let lastTapActionTimestamp = 0; // For debouncing SDK tap vs. Flick-tap
+
+// Refactored core tap/throw/catch logic
+function performThrowOrCatchAction(watchEntity: Entity) {
+  const now = Date.now();
+  if (now - lastTapActionTimestamp < TAP_ACTION_DEBOUNCE_MS) {
+    console.log('[performThrowOrCatchAction] Debounced due to rapid action.');
+    return; // Debounced
+  }
+  lastTapActionTimestamp = now;
+
+  const isCurrentlyThrown = watchEntity.get(IsThrown)?.value ?? false;
+  const currentThrowStrength = watchEntity.get(ConfigurableThrowStrength)?.value ?? 500;
+  console.log(`[performThrowOrCatchAction] Action initiated. IsCurrentlyThrown: ${isCurrentlyThrown}, ThrowStrength: ${currentThrowStrength}`);
+
+  if (isCurrentlyThrown) {
+    // Catch the mouse
+    watchEntity.set(IsThrown, { value: false });
+    watchEntity.set(MouseVelocity, { x: 0, y: 0 });
+    console.log('[performThrowOrCatchAction] Mouse Caught (was thrown).');
+  } else {
+    // Attempt to Throw the mouse
+    const configurableThrowWindow = watchEntity.get(ConfigurableThrowWindowMs)?.value ?? 50;
+    const tapTime = Date.now(); // Use current time for history check
+    const history = watchEntity.get(ArmDirectionHistory);
+
+    console.log(`[performThrowOrCatchAction] Attempting throw. ConfigurableWindowMs: ${configurableThrowWindow}, TapTime: ${tapTime}`);
+    
+    const recentSamples = (history?.samples || []).filter(
+      sample => tapTime - sample.timestamp <= (configurableThrowWindow) && tapTime - sample.timestamp >= 0
+    );
+    console.log(`[performThrowOrCatchAction] Found ${recentSamples.length} recent samples in history.`);
+    if (recentSamples.length > 5) { // Log first few samples if many
+        console.log('[performThrowOrCatchAction] First 5 recent samples:', recentSamples.slice(0,5));
+    }
+
+    let throwDx = 0;
+    let throwDy = 0;
+
+    if (recentSamples.length > 0) {
+      let sumDx = 0;
+      let sumDy = 0;
+      for (const sample of recentSamples) {
+        sumDx += sample.dx;
+        sumDy += sample.dy;
+      }
+      throwDx = sumDx / recentSamples.length;
+      throwDy = sumDy / recentSamples.length;
+      console.log(`[performThrowOrCatchAction] Using averaged history. Calculated Raw Dx:${throwDx.toFixed(3)}, Dy:${throwDy.toFixed(3)}`);
+    } else {
+      // Fallback to instantaneous if history is insufficient
+      const armDir = watchEntity.get(ArmDirection)?.value;
+      console.log('[performThrowOrCatchAction] No recent history samples. Fallback ArmDirection value:', armDir);
+      if (armDir && typeof armDir.x === 'number' && typeof armDir.y === 'number') { // Added type check for safety
+        throwDx = armDir.x;
+        throwDy = armDir.y;
+        console.log(`[performThrowOrCatchAction] Using instantaneous ArmDirection. Raw Dx:${throwDx.toFixed(3)}, Dy:${throwDy.toFixed(3)}`);
+      } else {
+        console.log('[performThrowOrCatchAction] No valid arm direction data (history or instantaneous). Cannot throw.');
+        return; // No direction to throw
+      }
+    }
+
+    console.log(`[performThrowOrCatchAction] Final Raw Throw Vector before zero check: Dx:${throwDx.toFixed(3)}, Dy:${throwDy.toFixed(3)}`);
+
+    if (throwDx === 0 && throwDy === 0) {
+        console.log('[performThrowOrCatchAction] Calculated throw vector is zero, mouse remains caught/stationary.');
+        watchEntity.set(IsThrown, { value: false }); // Ensure it's marked as not thrown
+        watchEntity.set(MouseVelocity, { x: 0, y: 0 });
+        return;
+    }
+
+    const finalVelX = throwDx * currentThrowStrength;
+    const finalVelY = throwDy * currentThrowStrength;
+
+    watchEntity.set(MouseVelocity, { 
+      x: finalVelX, 
+      y: finalVelY 
+    });
+    watchEntity.set(IsThrown, { value: true });
+    console.log(`[performThrowOrCatchAction] Mouse Thrown! Velocity: x:${finalVelX.toFixed(2)}, y:${finalVelY.toFixed(2)}`);
+  }
+}
+
 function WatchManager({ watchEntity }: { watchEntity: Entity }) {
-  const sdkWatch = useMemo(() => new Watch(), []); 
+  const sdkWatchRef = useRef<Watch | null>(null);
   const connectButtonContainerRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
+    const watch = new Watch(); // Reverted from Watch.getInstance()
+    sdkWatchRef.current = watch;
     if (connectButtonContainerRef.current) {
+      // Clear existing button before rendering a new one
       while (connectButtonContainerRef.current.firstChild) {
         connectButtonContainerRef.current.removeChild(connectButtonContainerRef.current.firstChild);
       }
-      const connectButton = sdkWatch.createConnectButton();
-      if (connectButton && connectButtonContainerRef.current) {
+      const connectButton = watch.createConnectButton();
+      if (connectButton) {
         connectButtonContainerRef.current.appendChild(connectButton);
       }
     }
 
     const handleConnected = () => {
       watchEntity.set(IsConnected, { value: true });
-      watchEntity.set(Hand, { value: sdkWatch.hand });
-      watchEntity.set(HapticsAvailable, { value: sdkWatch.hapticsAvailable });
-      watchEntity.set(TouchScreenRes, { value: sdkWatch.touchScreenResolution });
-      watchEntity.set(BatteryPercentage, { value: sdkWatch.batteryPercentage });
+      if (sdkWatchRef.current) { // Ensure watch instance exists
+        watchEntity.set(Hand, { value: sdkWatchRef.current.hand });
+        watchEntity.set(HapticsAvailable, { value: sdkWatchRef.current.hapticsAvailable });
+        watchEntity.set(TouchScreenRes, { value: sdkWatchRef.current.touchScreenResolution });
+        watchEntity.set(BatteryPercentage, { value: sdkWatchRef.current.batteryPercentage });
+      }
+    };
+    const handleDisconnected = () => watchEntity.set(IsConnected, { value: false });
+
+    // SDK Tap listener
+    const tapListener = () => {
+      console.log('[WatchManager] SDK tap event received.');
+      performThrowOrCatchAction(watchEntity);
     };
 
-    const tapListener = () => {
-      watchEntity.set(LastTapTime, { value: new Date() });
-      
-      const isThrownTrait = watchEntity.get(IsThrown);
-      const currentIsThrown = isThrownTrait ? isThrownTrait.value : false;
+    const probabilityListener = (event: CustomEvent<GestureProbDetail>) => {
+      const gestureProb = event.detail;
+      watchEntity.set(GestureProb, { value: gestureProb });
 
-      if (!currentIsThrown) {
-        let throwDx = 0;
-        let throwDy = 0;
-        const tapTime = Date.now();
-
-        const historyTrait = watchEntity.get(ArmDirectionHistory);
-        const recentSamples = (historyTrait?.samples || []).filter(
-          sample => tapTime - sample.timestamp <= (watchEntity.get(ConfigurableThrowWindowMs)?.value ?? 50) && tapTime - sample.timestamp >= 0 // ensure samples are not from future if clocks are weird
-        );
-
-        if (recentSamples.length > 0) {
-          let sumDx = 0;
-          let sumDy = 0;
-          for (const sample of recentSamples) {
-            sumDx += sample.dx;
-            sumDy += sample.dy;
-          }
-          throwDx = sumDx / recentSamples.length;
-          throwDy = sumDy / recentSamples.length;
-          console.log(`[TapListener] Using averaged history for throw. Samples in window (${(watchEntity.get(ConfigurableThrowWindowMs)?.value ?? 50)}ms): ${recentSamples.length}. Avg Dx: ${throwDx.toFixed(3)}, Dy: ${throwDy.toFixed(3)}`);
+      // Flick-tap detection based on probability
+      const currentFlickSensitivity = watchEntity.get(FlickSensitivity)?.value ?? 0;
+      if (currentFlickSensitivity > 0) {
+        const tapProbability = gestureProb?.tap ?? 0;
+        const probabilityThreshold = 1.0 - currentFlickSensitivity;
+        if (tapProbability > probabilityThreshold) {
+          console.log(`[WatchManager] Flick-tap detected! Prob: ${tapProbability.toFixed(3)} > Thresh: ${probabilityThreshold.toFixed(3)} (Sensitivity: ${currentFlickSensitivity.toFixed(2)})`);
+          performThrowOrCatchAction(watchEntity);
         }
-        
-        // Fallback to instantaneous if history is insufficient or resulted in zero movement
-        if (throwDx === 0 && throwDy === 0) {
-          const armDirectionTrait = watchEntity.get(ArmDirection);
-          const armDirectionValue = armDirectionTrait ? armDirectionTrait.value : null;
-          if (armDirectionValue) {
-            throwDx = armDirectionValue.x;
-            throwDy = armDirectionValue.y;
-            console.log('[TapListener] Using instantaneous ArmDirection for throw. Dx:', throwDx, 'Dy:', throwDy);
-          }
-        }
-
-        if (throwDx !== 0 || throwDy !== 0) {
-          const initialVelocity = {
-            x: throwDx * THROW_SPEED_SCALE,
-            y: throwDy * THROW_SPEED_SCALE, 
-          };
-          console.log('[TapListener] Attempting to THROW. Final Dir: (', throwDx.toFixed(3), ',', throwDy.toFixed(3), ') Initial Velocity:', initialVelocity);
-          watchEntity.set(MouseVelocity, initialVelocity);
-          watchEntity.set(IsThrown, { value: true });
-        } else {
-          console.log('[TapListener] Attempting to THROW, but arm direction is zero (either from history or instantaneous).');
-        }
-      } else {
-        console.log('[TapListener] Attempting to CATCH. Current IsThrown:', currentIsThrown);
-        watchEntity.set(MouseVelocity, { x: 0, y: 0 });
-        watchEntity.set(IsThrown, { value: false });
       }
     };
 
-    const probabilityListener = (event: CustomEvent) => { watchEntity.set(GestureProb, { value: event.detail }); };
-    const armDirectionListener = (event: CustomEvent) => {
-      const { dx, dy } = event.detail;
-      watchEntity.set(ArmDirection, { value: { x: dx, y: dy } });
+    const armDirectionListener = (event: CustomEvent<{ dx: number; dy: number }>) => { 
+      const eventData = event.detail;
+      // Ensure that eventData and its dx, dy properties are valid numbers
+      if (eventData && typeof eventData.dx === 'number' && typeof eventData.dy === 'number') {
+        // Set ArmDirection trait with x and y properties, using dx/dy from event
+        watchEntity.set(ArmDirection, { value: { x: eventData.dx, y: eventData.dy } });
 
-      const historyTrait = watchEntity.get(ArmDirectionHistory);
-      let currentSamples = historyTrait?.samples ? [...historyTrait.samples] : [];
+        const historyTrait = watchEntity.get(ArmDirectionHistory);
+        let currentSamples = historyTrait?.samples ? [...historyTrait.samples] : [];
 
-      currentSamples.push({ dx, dy, timestamp: Date.now() });
+        // History samples directly use dx and dy from event
+        currentSamples.push({ dx: eventData.dx, dy: eventData.dy, timestamp: Date.now() });
 
-      const now = Date.now();
-      currentSamples = currentSamples.filter(sample => now - sample.timestamp <= ARM_DIRECTION_HISTORY_MAX_AGE_MS);
-
-      watchEntity.set(ArmDirectionHistory, { samples: currentSamples });
+        const now = Date.now();
+        currentSamples = currentSamples.filter(sample => now - sample.timestamp <= ARM_DIRECTION_HISTORY_MAX_AGE_MS);
+        watchEntity.set(ArmDirectionHistory, { samples: currentSamples });
+      } else {
+        console.warn('[WatchManager] armDirectionListener received invalid or incomplete arm direction data:', eventData);
+      }
     };
-    const accelerationListener = (event: CustomEvent) => { watchEntity.set(Acceleration, { value: event.detail }); };
-    const angularVelocityListener = (event: CustomEvent) => { watchEntity.set(AngularVelocity, { value: event.detail }); };
-    const gravityVectorListener = (event: CustomEvent) => { watchEntity.set(GravityVector, { value: event.detail }); };
-    const orientationListener = (event: CustomEvent) => { watchEntity.set(Orientation, { value: event.detail }); };
-    const touchStartListener = (event: CustomEvent) => { watchEntity.set(TouchPosition, { value: event.detail }); watchEntity.set(LastTouchEvent, { value: 'touchstart' }); };
-    const touchMoveListener = (event: CustomEvent) => { watchEntity.set(TouchPosition, { value: event.detail }); watchEntity.set(LastTouchEvent, { value: 'touchmove' }); };
-    const touchEndListener = (event: CustomEvent) => { watchEntity.set(TouchPosition, { value: event.detail }); watchEntity.set(LastTouchEvent, { value: 'touchend' }); };
-    const touchCancelListener = (event: CustomEvent) => { watchEntity.set(TouchPosition, { value: event.detail }); watchEntity.set(LastTouchEvent, { value: 'touchcancel' }); };
-    const rotaryListener = (event: CustomEvent) => { watchEntity.set(RotaryStep, { value: event.detail.step }); };
+    const accelerationListener = (event: CustomEvent<Vector3>) => { watchEntity.set(Acceleration, { value: event.detail }); };
+    const angularVelocityListener = (event: CustomEvent<Vector3>) => { watchEntity.set(AngularVelocity, { value: event.detail }); };
+    const gravityVectorListener = (event: CustomEvent<Vector3>) => { watchEntity.set(GravityVector, { value: event.detail }); };
+    const orientationListener = (event: CustomEvent<Vector4>) => { watchEntity.set(Orientation, { value: event.detail }); };
+    const touchStartListener = (event: CustomEvent<Vector2>) => { watchEntity.set(TouchPosition, { value: event.detail }); watchEntity.set(LastTouchEvent, { value: 'touchstart' }); };
+    const touchMoveListener = (event: CustomEvent<Vector2>) => { watchEntity.set(TouchPosition, { value: event.detail }); watchEntity.set(LastTouchEvent, { value: 'touchmove' }); };
+    const touchEndListener = (event: CustomEvent<Vector2>) => { watchEntity.set(TouchPosition, { value: event.detail }); watchEntity.set(LastTouchEvent, { value: 'touchend' }); };
+    const touchCancelListener = (event: CustomEvent<Vector2>) => { watchEntity.set(TouchPosition, { value: event.detail }); watchEntity.set(LastTouchEvent, { value: 'touchcancel' }); };
+    const rotaryListener = (event: CustomEvent<{ step: number }>) => { watchEntity.set(RotaryStep, { value: event.detail.step }); };
     const buttonListener = () => { watchEntity.set(LastButtonPressTime, { value: new Date() }); };
 
-    sdkWatch.addEventListener('connected', handleConnected);
-    sdkWatch.addEventListener('tap', tapListener);
-    sdkWatch.addEventListener('probability', probabilityListener as EventListener);
-    sdkWatch.addEventListener('armdirectionchanged', armDirectionListener as EventListener);
-    sdkWatch.addEventListener('accelerationchanged', accelerationListener as EventListener);
-    sdkWatch.addEventListener('angularvelocitychanged', angularVelocityListener as EventListener);
-    sdkWatch.addEventListener('gravityvectorchanged', gravityVectorListener as EventListener);
-    sdkWatch.addEventListener('orientationchanged', orientationListener as EventListener);
-    sdkWatch.addEventListener('touchstart', touchStartListener as EventListener);
-    sdkWatch.addEventListener('touchmove', touchMoveListener as EventListener);
-    sdkWatch.addEventListener('touchend', touchEndListener as EventListener);
-    sdkWatch.addEventListener('touchcancel', touchCancelListener as EventListener);
-    sdkWatch.addEventListener('rotary', rotaryListener as EventListener);
-    sdkWatch.addEventListener('button', buttonListener);
+    watch.addEventListener('connected', handleConnected);
+    watch.addEventListener('disconnected', handleDisconnected);
+    watch.addEventListener('tap', tapListener);
+    watch.addEventListener('probability', probabilityListener as EventListener);
+    watch.addEventListener('armdirectionchanged', armDirectionListener as EventListener);
+    watch.addEventListener('accelerationchanged', accelerationListener as EventListener);
+    watch.addEventListener('angularvelocitychanged', angularVelocityListener as EventListener);
+    watch.addEventListener('gravityvectorchanged', gravityVectorListener as EventListener);
+    watch.addEventListener('orientationchanged', orientationListener as EventListener);
+    watch.addEventListener('touchstart', touchStartListener as EventListener);
+    watch.addEventListener('touchmove', touchMoveListener as EventListener);
+    watch.addEventListener('touchend', touchEndListener as EventListener);
+    watch.addEventListener('touchcancel', touchCancelListener as EventListener);
+    watch.addEventListener('rotary', rotaryListener as EventListener);
+    watch.addEventListener('button', buttonListener);
 
     return () => {
-      sdkWatch.removeEventListener('connected', handleConnected);
-      sdkWatch.removeEventListener('tap', tapListener);
-      sdkWatch.removeEventListener('probability', probabilityListener as EventListener);
-      sdkWatch.removeEventListener('armdirectionchanged', armDirectionListener as EventListener);
-      sdkWatch.removeEventListener('accelerationchanged', accelerationListener as EventListener);
-      sdkWatch.removeEventListener('angularvelocitychanged', angularVelocityListener as EventListener);
-      sdkWatch.removeEventListener('gravityvectorchanged', gravityVectorListener as EventListener);
-      sdkWatch.removeEventListener('orientationchanged', orientationListener as EventListener);
-      sdkWatch.removeEventListener('touchstart', touchStartListener as EventListener);
-      sdkWatch.removeEventListener('touchmove', touchMoveListener as EventListener);
-      sdkWatch.removeEventListener('touchend', touchEndListener as EventListener);
-      sdkWatch.removeEventListener('touchcancel', touchCancelListener as EventListener);
-      sdkWatch.removeEventListener('rotary', rotaryListener as EventListener);
-      sdkWatch.removeEventListener('button', buttonListener);
+      watch.removeEventListener('connected', handleConnected);
+      watch.removeEventListener('disconnected', handleDisconnected);
+      watch.removeEventListener('tap', tapListener);
+      watch.removeEventListener('probability', probabilityListener as EventListener);
+      watch.removeEventListener('armdirectionchanged', armDirectionListener as EventListener);
+      watch.removeEventListener('accelerationchanged', accelerationListener as EventListener);
+      watch.removeEventListener('angularvelocitychanged', angularVelocityListener as EventListener);
+      watch.removeEventListener('gravityvectorchanged', gravityVectorListener as EventListener);
+      watch.removeEventListener('orientationchanged', orientationListener as EventListener);
+      watch.removeEventListener('touchstart', touchStartListener as EventListener);
+      watch.removeEventListener('touchmove', touchMoveListener as EventListener);
+      watch.removeEventListener('touchend', touchEndListener as EventListener);
+      watch.removeEventListener('touchcancel', touchCancelListener as EventListener);
+      watch.removeEventListener('rotary', rotaryListener as EventListener);
+      watch.removeEventListener('button', buttonListener);
     };
-  }, [sdkWatch, watchEntity]);
+  }, [watchEntity]); // Removed sdkWatchRef from dependency array as watch instance is stable within useEffect
 
   const isConnectedValue = useTrait(watchEntity, IsConnected)?.value;
   const hapticsAvailableValue = useTrait(watchEntity, HapticsAvailable)?.value;
 
   const triggerHaptics = () => {
-    if (sdkWatch && isConnectedValue && hapticsAvailableValue) {
-      sdkWatch.triggerHaptics(0.7, 100);
+    if (sdkWatchRef.current && isConnectedValue && hapticsAvailableValue) {
+      sdkWatchRef.current.triggerHaptics(0.7, 100);
     } else {
       globalThis.alert('Haptics not available or watch not connected.');
     }
@@ -318,6 +381,7 @@ function DebugThrowVectorLine({ watchEntity }: { watchEntity: Entity }) {
   // Get configurable settings from Koota traits
   const configurableThrowWindow = useTrait(watchEntity, ConfigurableThrowWindowMs)?.value ?? 50;
   const showDebugLineSetting = useTrait(watchEntity, ShowDebugLine)?.value ?? false;
+  const currentThrowStrength = useTrait(watchEntity, ConfigurableThrowStrength)?.value ?? 500;
 
   const [linePoints, setLinePoints] = useState<[THREE.Vector3, THREE.Vector3]>([
     new THREE.Vector3(0,0,0.1),
@@ -368,8 +432,8 @@ function DebugThrowVectorLine({ watchEntity }: { watchEntity: Entity }) {
     const startX_r3f = kootaMousePos.x - globalThis.innerWidth / 2;
     const startY_r3f = -(kootaMousePos.y - globalThis.innerHeight / 2);
 
-    const vecX_r3f = potentialDx * THROW_SPEED_SCALE * DEBUG_LINE_VISUAL_SCALE;
-    const vecY_r3f = -(potentialDy * THROW_SPEED_SCALE * DEBUG_LINE_VISUAL_SCALE); // Y is inverted
+    const vecX_r3f = potentialDx * currentThrowStrength * DEBUG_LINE_VISUAL_SCALE;
+    const vecY_r3f = -(potentialDy * currentThrowStrength * DEBUG_LINE_VISUAL_SCALE); // Y is inverted
 
     const endX_r3f = startX_r3f + vecX_r3f;
     const endY_r3f = startY_r3f + vecY_r3f;
@@ -490,6 +554,8 @@ function WatchInfoDisplay({ watchEntity }: { watchEntity: Entity }) {
   // Get new configurable traits for UI
   const configurableThrowWindowMsTrait = useTrait(watchEntity, ConfigurableThrowWindowMs);
   const showDebugLineTrait = useTrait(watchEntity, ShowDebugLine);
+  const configurableThrowStrengthTrait = useTrait(watchEntity, ConfigurableThrowStrength); // For UI
+  const flickSensitivityTrait = useTrait(watchEntity, FlickSensitivity);                // For UI
 
   return (
     <div className="card">
@@ -505,12 +571,12 @@ function WatchInfoDisplay({ watchEntity }: { watchEntity: Entity }) {
       <h3>Events Data:</h3>
       <div>Last Tap: {lastTap ? lastTap.toLocaleTimeString() : 'N/A'}</div>
       <div>Gesture Probability: {gestureProbability ? JSON.stringify(gestureProbability) : 'N/A'}</div>
-      <div>Arm Direction: {armDirection ? `x: ${armDirection.x.toFixed(2)}, y: ${armDirection.y.toFixed(2)}` : 'N/A'}</div>
-      <div>Acceleration: {acceleration ? `x: ${acceleration.x.toFixed(2)}, y: ${acceleration.y.toFixed(2)}, z: ${acceleration.z.toFixed(2)}` : 'N/A'}</div>
-      <div>Angular Velocity: {angularVelocity ? `x: ${angularVelocity.x.toFixed(2)}, y: ${angularVelocity.y.toFixed(2)}, z: ${angularVelocity.z.toFixed(2)}` : 'N/A'}</div>
-      <div>Gravity Vector: {gravityVector ? `x: ${gravityVector.x.toFixed(2)}, y: ${gravityVector.y.toFixed(2)}, z: ${gravityVector.z.toFixed(2)}` : 'N/A'}</div>
-      <div>Orientation: {orientation ? `x: ${orientation.x.toFixed(2)}, y: ${orientation.y.toFixed(2)}, z: ${orientation.z.toFixed(2)}, w: ${orientation.w.toFixed(2)}` : 'N/A'}</div>
-      <div>Last Touch Event: {lastTouchEvent ?? 'N/A'} {touchPosition ? `(x: ${touchPosition.x}, y: ${touchPosition.y})` : ''}</div>
+      <div>Arm Direction: {armDirection && typeof armDirection.x === 'number' && typeof armDirection.y === 'number' ? `x: ${armDirection.x.toFixed(2)}, y: ${armDirection.y.toFixed(2)}` : 'N/A'}</div>
+      <div>Acceleration: {acceleration && typeof acceleration.x === 'number' && typeof acceleration.y === 'number' && typeof acceleration.z === 'number' ? `x: ${acceleration.x.toFixed(2)}, y: ${acceleration.y.toFixed(2)}, z: ${acceleration.z.toFixed(2)}` : 'N/A'}</div>
+      <div>Angular Velocity: {angularVelocity && typeof angularVelocity.x === 'number' && typeof angularVelocity.y === 'number' && typeof angularVelocity.z === 'number' ? `x: ${angularVelocity.x.toFixed(2)}, y: ${angularVelocity.y.toFixed(2)}, z: ${angularVelocity.z.toFixed(2)}` : 'N/A'}</div>
+      <div>Gravity Vector: {gravityVector && typeof gravityVector.x === 'number' && typeof gravityVector.y === 'number' && typeof gravityVector.z === 'number' ? `x: ${gravityVector.x.toFixed(2)}, y: ${gravityVector.y.toFixed(2)}, z: ${gravityVector.z.toFixed(2)}` : 'N/A'}</div>
+      <div>Orientation: {orientation && typeof orientation.x === 'number' && typeof orientation.y === 'number' && typeof orientation.z === 'number' && typeof orientation.w === 'number' ? `x: ${orientation.x.toFixed(2)}, y: ${orientation.y.toFixed(2)}, z: ${orientation.z.toFixed(2)}, w: ${orientation.w.toFixed(2)}` : 'N/A'}</div>
+      <div>Last Touch Event: {lastTouchEvent ?? 'N/A'} {touchPosition && typeof touchPosition.x === 'number' && typeof touchPosition.y === 'number' ? `(x: ${touchPosition.x}, y: ${touchPosition.y})` : ''}</div>
       <div>Rotary Step: {rotaryStep === null ? 'N/A' : rotaryStep}</div>
       <div>Last Button Press: {lastButtonPress ? lastButtonPress.toLocaleTimeString() : 'N/A'}</div>
       
@@ -544,6 +610,41 @@ function WatchInfoDisplay({ watchEntity }: { watchEntity: Entity }) {
           style={{ marginLeft: '10px' }}
         />
       </div>
+      <div>
+        Throw Strength:
+        <input
+          type="number"
+          value={configurableThrowStrengthTrait?.value ?? 500}
+          onChange={(e) => {
+            const val = parseInt(e.target.value, 10);
+            if (!isNaN(val) && watchEntity) {
+              watchEntity.set(ConfigurableThrowStrength, { value: val });
+            }
+          }}
+          min="50"
+          max="2000"
+          step="50"
+          style={{ marginLeft: '10px', width: '70px' }}
+        />
+      </div>
+      <div>
+        Flick Sensitivity (0=SDK Tap, 1=Max Prob. Flick):
+        <input
+          type="range" // Slider for sensitivity
+          value={flickSensitivityTrait?.value ?? 0.0}
+          onChange={(e) => {
+            const val = parseFloat(e.target.value);
+            if (!isNaN(val) && watchEntity) {
+              watchEntity.set(FlickSensitivity, { value: val });
+            }
+          }}
+          min="0.0"
+          max="1" // Max 0.95 to avoid threshold of 0.05, which might be too sensitive
+          step="0.05"
+          style={{ marginLeft: '10px', width: '150px', verticalAlign: 'middle' }}
+        />
+        <span style={{ marginLeft: '10px' }}>{(flickSensitivityTrait?.value ?? 0.0).toFixed(2)}</span>
+      </div>
     </div>
   );
 }
@@ -552,7 +653,7 @@ function AppContent() {
   const worldInstance = useWorld();
 
   const watchEntity = useMemo(() => {
-    const existing = worldInstance.query(IsConnected, Hand, MousePosition); // Keep query simple
+    const existing = worldInstance.query(IsConnected, Hand, MousePosition); 
     if (existing.length > 0) return existing[0];
     
     return worldInstance.spawn(
@@ -563,10 +664,13 @@ function AppContent() {
       MouseVelocity, 
       IsThrown,
       ArmDirectionHistory,
-      ConfigurableThrowWindowMs, // Add new trait for config
-      ShowDebugLine              // Add new trait for config
+      ConfigurableThrowWindowMs, 
+      ShowDebugLine,             
+      ConfigurableThrowStrength, // Add new trait for config
+      FlickSensitivity           // Add new trait for config
     );
   }, [worldInstance]);
+
 
   useEffect(() => {
     // Initialize mouse position if it's the first run and entity is newly spawned
