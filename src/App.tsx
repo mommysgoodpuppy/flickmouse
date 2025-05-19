@@ -35,7 +35,7 @@ const BOUNDARY_PADDING = 50; // Added padding constant
 // Koota traits for configuration
 const ConfigurableThrowWindowMs = trait({ value: 50 }); 
 const ShowDebugLine = trait({ value: false }); 
-const ConfigurableThrowStrength = trait({ value: 500 }); // New trait for throw strength
+const ConfigurableThrowStrength = trait({ value: 900 }); // New trait for throw strength
 const FlickSensitivity = trait({ value: 0.0 });          // New trait for flick sensitivity (0.0 to 1.0)
 const ConfigurableLookaheadDelayMs = trait({ value: 30 }); // New trait for lookahead delay
 const IsThrowPending = trait({ value: false });           // True if waiting for lookahead to complete for a throw
@@ -86,7 +86,7 @@ const executeActualThrowLogic = (watchEntity: Entity, tapTimestamp: number) => {
       return;
   }
 
-  const currentThrowStrength = watchEntity.get(ConfigurableThrowStrength)?.value ?? 500;
+  const currentThrowStrength = watchEntity.get(ConfigurableThrowStrength)?.value ?? 900;
   const configurableThrowWindowMs = watchEntity.get(ConfigurableThrowWindowMs)?.value ?? 50;
   // Get the lookaheadDelay that was active when the throw was initiated, passed via tapTimestamp context.
   // For calculating sample window, we re-fetch. This could be passed if strictness is needed.
@@ -167,8 +167,8 @@ const executeActualThrowLogic = (watchEntity: Entity, tapTimestamp: number) => {
     if (pathSegments.length > 0) {
       // Calculate ending angular velocity if enough segments exist
       if (pathSegments.length >= MIN_SEGMENTS_FOR_ENDING_CURVE) {
-        let totalAngleDiff = 0;
-        let totalRelevantDuration = 0;
+        let weightedSumAngularVelocity = 0;
+        let sumOfWeights = 0;
         let numAngleDiffsCalculated = 0;
 
         for (let i = 0; i < pathSegments.length - 1; i++) {
@@ -182,18 +182,22 @@ const executeActualThrowLogic = (watchEntity: Entity, tapTimestamp: number) => {
             while (angleDiff < -Math.PI) angleDiff += 2 * Math.PI;
 
             const relevantDuration = seg2.duration > 0.001 ? seg2.duration : 0.02; 
+            const currentAngularVelocity = angleDiff / relevantDuration;
+            
+            // Weight increases for later segments (i.e., higher index i)
+            const weight = i + 1; 
 
-            totalAngleDiff += angleDiff;
-            totalRelevantDuration += relevantDuration;
+            weightedSumAngularVelocity += currentAngularVelocity * weight;
+            sumOfWeights += weight;
             numAngleDiffsCalculated++;
         }
 
-        if (numAngleDiffsCalculated > 0 && totalRelevantDuration > 0.001) {
-            calculatedEndingAngularVelocity = totalAngleDiff / totalRelevantDuration;
-            console.log(`[executeActualThrowLogic] Avg EndingAngVel: totalDiff=${totalAngleDiff.toFixed(3)}, totalDur=${totalRelevantDuration.toFixed(3)}, num=${numAngleDiffsCalculated}, result=${calculatedEndingAngularVelocity.toFixed(3)}`);
+        if (numAngleDiffsCalculated > 0 && sumOfWeights > 0) {
+            calculatedEndingAngularVelocity = weightedSumAngularVelocity / sumOfWeights;
+            console.log(`[executeActualThrowLogic] Weighted Avg EndingAngVel: sumWeightedVel=${weightedSumAngularVelocity.toFixed(3)}, sumWeights=${sumOfWeights.toFixed(3)}, num=${numAngleDiffsCalculated}, result=${calculatedEndingAngularVelocity.toFixed(3)}`);
         } else {
             calculatedEndingAngularVelocity = 0.0;
-            console.log(`[executeActualThrowLogic] Avg EndingAngVel: Not enough data or zero duration. Result: 0.0`);
+            console.log(`[executeActualThrowLogic] Weighted Avg EndingAngVel: Not enough data or zero weights. Result: 0.0`);
         }
       } else {
         calculatedEndingAngularVelocity = 0.0; // Not enough segments
@@ -428,18 +432,12 @@ function WatchManager({ watchEntity }: { watchEntity: Entity }) {
   const isThrowPendingTrait = useTrait(watchEntity, IsThrowPending); // For UI debug
   const enableCurveballTrait = useTrait(watchEntity, EnableCurveball); // For UI
 
-  const triggerHaptics = () => {
-    if (sdkWatchRef.current && isConnectedValue && hapticsAvailableValue) {
-      sdkWatchRef.current.triggerHaptics(0.7, 100);
-    } else {
-      globalThis.alert('Haptics not available or watch not connected.');
-    }
-  };
+
 
   return (
     <>
       <div ref={connectButtonContainerRef} style={{ marginBottom: '20px' }}></div>
-      <button type="button" onClick={triggerHaptics} disabled={!hapticsAvailableValue || !isConnectedValue} style={{ marginTop: '10px' }}>Trigger Haptics</button>
+      
       {/* Debug display for IsThrowPending */}
       
     </>
@@ -622,7 +620,7 @@ function DebugThrowVectorLine({ watchEntity }: { watchEntity: Entity }) {
   
   const configurableThrowWindow = useTrait(watchEntity, ConfigurableThrowWindowMs)?.value ?? 50;
   const showDebugLineSetting = useTrait(watchEntity, ShowDebugLine)?.value ?? false;
-  const currentThrowStrength = useTrait(watchEntity, ConfigurableThrowStrength)?.value ?? 500;
+  const currentThrowStrength = useTrait(watchEntity, ConfigurableThrowStrength)?.value ?? 900;
 
   const [linePoints, setLinePoints] = useState<THREE.Vector3[]>([
     new THREE.Vector3(0,0,0.1),
@@ -876,7 +874,7 @@ function WatchInfoDisplay({ watchEntity }: { watchEntity: Entity }) {
         Throw Strength:
         <input
           type="number"
-          value={configurableThrowStrengthTrait?.value ?? 500}
+          value={configurableThrowStrengthTrait?.value ?? 900}
           onChange={(e) => {
             const val = parseInt(e.target.value, 10);
             if (!isNaN(val) && watchEntity) {
