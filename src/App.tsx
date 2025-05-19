@@ -17,7 +17,10 @@ const ARM_DIRECTION_HISTORY_MAX_AGE_MS = 200; // Max age of samples in history (
 const MIN_THROW_SPEED_THRESHOLD = 5.0;    // Speed (pixels/sec) below which throw stops
 const DEBUG_LINE_VISUAL_SCALE = 0.1;      // Scales potential throw speed to debug line length
 const TAP_ACTION_DEBOUNCE_MS = 100;       // Debounce time for tap/flick actions
-// const CURVE_INTENSITY_FACTOR = 0.1; // Adjust to control curve intensity (rad/s per unit of detected angular speed) - No longer used with ThrowPathPlan
+
+const ANGULAR_FRICTION_CONSTANT = 0.8;         // How quickly the sustained curve diminishes (higher = faster decay)
+const MIN_CONTINUING_ANGULAR_VELOCITY = 0.02; // rad/s, below which curve stops
+const MIN_SEGMENTS_FOR_ENDING_CURVE = 2;      // Min path segments needed to calculate a sustained curve
 
 // Updated Friction Constants (from user Step 152)
 const FRICTION_FACTOR_HIGH_SPEED = 1.4;    // Friction factor at high speeds
@@ -41,6 +44,7 @@ const ThrowPathPlan = trait({
   segments: [] as { dx: number; dy: number; duration: number }[],
   currentIndex: 0,
   activeTimeInSegment: 0, // Time spent in current segment
+  endingAngularVelocity: 0.0, // Calculated angular velocity from the end of the gesture
 });
 
 const IsConnected = trait({ value: false });
@@ -65,6 +69,7 @@ const MouseVelocity = trait({ x: 0, y: 0 });
 const IsThrown = trait({ value: false });
 const ArmDirectionHistory = trait({ samples: [] as { dx: number; dy: number; timestamp: number }[] });
 const MouseAngularVelocityCurve = trait({ value: 0.0 }); // Angular velocity for curveball throw (rad/s)
+const MouseContinuingAngularVelocity = trait({ value: 0.0 }); // For sustained curve after path plan
 
 export const world = createWorld();
 
@@ -137,6 +142,7 @@ const executeActualThrowLogic = (watchEntity: Entity, tapTimestamp: number) => {
   if (enableCurveball && recentSamples.length > 0) {
     const sortedSamples = [...recentSamples].sort((a, b) => a.timestamp - b.timestamp);
     const pathSegments: { dx: number; dy: number; duration: number }[] = [];
+    let calculatedEndingAngularVelocity = 0.0;
 
     for (let i = 0; i < sortedSamples.length; i++) {
       const currentSample = sortedSamples[i];
@@ -159,7 +165,50 @@ const executeActualThrowLogic = (watchEntity: Entity, tapTimestamp: number) => {
     }
 
     if (pathSegments.length > 0) {
-      watchEntity.set(ThrowPathPlan, { segments: pathSegments, currentIndex: 0, activeTimeInSegment: 0 });
+      // Calculate ending angular velocity if enough segments exist
+      if (pathSegments.length >= MIN_SEGMENTS_FOR_ENDING_CURVE) {
+        let totalAngleDiff = 0;
+        let totalRelevantDuration = 0;
+        let numAngleDiffsCalculated = 0;
+
+        for (let i = 0; i < pathSegments.length - 1; i++) {
+            const seg1 = pathSegments[i];
+            const seg2 = pathSegments[i+1];
+            
+            const angle1 = Math.atan2(seg1.dy, seg1.dx);
+            const angle2 = Math.atan2(seg2.dy, seg2.dx);
+            let angleDiff = angle2 - angle1;
+            while (angleDiff > Math.PI) angleDiff -= 2 * Math.PI;
+            while (angleDiff < -Math.PI) angleDiff += 2 * Math.PI;
+
+            const relevantDuration = seg2.duration > 0.001 ? seg2.duration : 0.02; 
+
+            totalAngleDiff += angleDiff;
+            totalRelevantDuration += relevantDuration;
+            numAngleDiffsCalculated++;
+        }
+
+        if (numAngleDiffsCalculated > 0 && totalRelevantDuration > 0.001) {
+            calculatedEndingAngularVelocity = totalAngleDiff / totalRelevantDuration;
+            console.log(`[executeActualThrowLogic] Avg EndingAngVel: totalDiff=${totalAngleDiff.toFixed(3)}, totalDur=${totalRelevantDuration.toFixed(3)}, num=${numAngleDiffsCalculated}, result=${calculatedEndingAngularVelocity.toFixed(3)}`);
+        } else {
+            calculatedEndingAngularVelocity = 0.0;
+            console.log(`[executeActualThrowLogic] Avg EndingAngVel: Not enough data or zero duration. Result: 0.0`);
+        }
+      } else {
+        calculatedEndingAngularVelocity = 0.0; // Not enough segments
+        console.log(`[executeActualThrowLogic] EndingAngVel: Not enough segments (${pathSegments.length}). Result: 0.0`);
+      }
+
+      watchEntity.set(ThrowPathPlan, { 
+        segments: pathSegments, 
+        currentIndex: 0, 
+        activeTimeInSegment: 0, 
+        endingAngularVelocity: calculatedEndingAngularVelocity 
+      });
+      watchEntity.set(MouseContinuingAngularVelocity, { value: calculatedEndingAngularVelocity });
+      console.log(`[executeActualThrowLogic] Set MouseContinuingAngularVelocity to: ${calculatedEndingAngularVelocity.toFixed(4)}`);
+
       // Override throwDx/Dy with the first segment's normalized direction for the initial impulse
       throwDx = pathSegments[0].dx;
       throwDy = pathSegments[0].dy;
@@ -167,15 +216,16 @@ const executeActualThrowLogic = (watchEntity: Entity, tapTimestamp: number) => {
     } else {
       // Fallback: Curveball enabled, but no valid path segments created (e.g., no movement in samples)
       // Use the base throwDx, throwDy calculated earlier.
-      watchEntity.set(ThrowPathPlan, { segments: [], currentIndex: 0, activeTimeInSegment: 0 });
+      watchEntity.set(ThrowPathPlan, { segments: [], currentIndex: 0, activeTimeInSegment: 0, endingAngularVelocity: 0.0 });
+      watchEntity.set(MouseContinuingAngularVelocity, { value: 0.0 }); // No sustained curve
       console.log('[executeActualThrowLogic] Curveball enabled, but Path Plan failed (e.g. no movement in samples). Using base straight direction.');
     }
     watchEntity.set(MouseAngularVelocityCurve, { value: 0.0 }); // Ensure old curve logic is off
 
   } else { // Not enableCurveball, or no recent samples available for curveball path planning
-    // Ensure plan is cleared if not using curveball, or if curveball is on but no samples.
-    watchEntity.set(ThrowPathPlan, { segments: [], currentIndex: 0, activeTimeInSegment: 0 });
+    watchEntity.set(ThrowPathPlan, { segments: [], currentIndex: 0, activeTimeInSegment: 0, endingAngularVelocity: 0.0 });
     watchEntity.set(MouseAngularVelocityCurve, { value: 0.0 }); // Clear old curve value
+    watchEntity.set(MouseContinuingAngularVelocity, { value: 0.0 }); // Clear continuing curve
     // throwDx, throwDy will be the base values calculated above.
     // console.log('[executeActualThrowLogic] Not using curveball path plan (disabled or no samples). Using base straight direction.');
   }
@@ -391,20 +441,7 @@ function WatchManager({ watchEntity }: { watchEntity: Entity }) {
       <div ref={connectButtonContainerRef} style={{ marginBottom: '20px' }}></div>
       <button type="button" onClick={triggerHaptics} disabled={!hapticsAvailableValue || !isConnectedValue} style={{ marginTop: '10px' }}>Trigger Haptics</button>
       {/* Debug display for IsThrowPending */}
-      { (isThrowPendingTrait?.value) && <div style={{color: 'orange'}}>Throw Pending (Lookahead)...</div> }
-      <div>
-        Enable Curveball Throw:
-        <input
-          type="checkbox"
-          checked={enableCurveballTrait?.value ?? false}
-          onChange={(e) => {
-            if (watchEntity) {
-              watchEntity.set(EnableCurveball, { value: e.target.checked });
-            }
-          }}
-          style={{ marginLeft: '10px' }}
-        />
-      </div>
+      
     </>
   );
 }
@@ -426,6 +463,8 @@ function R3FMouseCursor({ entity }: { entity: Entity }) {
     const isThrownState = entity.get(IsThrown);   // Snapshot of IsThrown for this frame's logic
     // const angularVelocityCurve = entity.get(MouseAngularVelocityCurve)?.value ?? 0.0; // No longer primary for curve
     const pathPlanTrait = entity.get(ThrowPathPlan); // Get the whole trait
+    const continuingAngularVelocityState = entity.get(MouseContinuingAngularVelocity);
+    const currentContinuingAngularVelocity = continuingAngularVelocityState?.value ?? 0.0;
 
     if (!kootaPosition || !kootaVelocity || !isThrownState) {
       // console.log('[R3FMouseCursor] Missing Koota data, skipping frame.');
@@ -449,7 +488,7 @@ function R3FMouseCursor({ entity }: { entity: Entity }) {
         const plan = pathPlanTrait; // Use 'plan' for brevity, Koota will see updates to this reference
         const segment = plan.segments[plan.currentIndex];
 
-        if (currentSpeed > 0.01) { // Only change direction if moving
+        if (currentSpeed > 0.01) { 
             newKootaVelX = segment.dx * currentSpeed;
             newKootaVelY = segment.dy * currentSpeed;
         }
@@ -465,13 +504,51 @@ function R3FMouseCursor({ entity }: { entity: Entity }) {
           } else {
             // On last segment, mouse will continue in this direction
             // console.log('[R3FMouseCursor] Path plan: On last segment.');
+            // Ensure the plan is marked as fully completed for the next frame:
+            plan.currentIndex++; // Advance beyond the last segment index
+            plan.activeTimeInSegment = 0; // Reset time for tidiness
+            console.log(`[R3FMouseCursor] Path plan COMPLETED. currentIndex set to ${plan.currentIndex}`);
           }
         }
         // Update the Koota trait with the modified plan state for persistence & reactivity
-        entity.set(ThrowPathPlan, { segments: plan.segments, currentIndex: plan.currentIndex, activeTimeInSegment: plan.activeTimeInSegment });
+        entity.set(ThrowPathPlan, { 
+            segments: plan.segments, 
+            currentIndex: plan.currentIndex, 
+            activeTimeInSegment: plan.activeTimeInSegment,
+            endingAngularVelocity: plan.endingAngularVelocity // Preserve this
+        });
       }
       // Old angularVelocityCurve logic is intentionally removed when enableCurveball is true to prioritize path plan
 
+      // Sustained Curve Logic (if enabled and not actively following a plan segment or plan just finished)
+      const isPathPlanActive = enableCurveball && pathPlanTrait && pathPlanTrait.segments.length > 0 && pathPlanTrait.currentIndex < pathPlanTrait.segments.length;
+
+      if (enableCurveball && !isPathPlanActive && currentSpeed > MIN_THROW_SPEED_THRESHOLD) { // Ensure mouse is still moving significantly
+        if (currentContinuingAngularVelocity !== 0) {
+          //console.log(`[R3FMouseCursor] Applying Sustained Curve. Speed: ${currentSpeed.toFixed(2)}, AngVel: ${currentContinuingAngularVelocity.toFixed(4)}`);
+          const angleDelta = currentContinuingAngularVelocity * delta;
+          const cosA = Math.cos(angleDelta);
+          const sinA = Math.sin(angleDelta);
+          const newVelXRotated = newKootaVelX * cosA - newKootaVelY * sinA;
+          const newVelYRotated = newKootaVelX * sinA + newKootaVelY * cosA;
+          newKootaVelX = newVelXRotated;
+          newKootaVelY = newVelYRotated;
+
+          // Apply angular friction to the velocity that will be used for the *next* frame
+          let nextContinuingAngularVelocity = currentContinuingAngularVelocity * (1 - ANGULAR_FRICTION_CONSTANT * delta);
+          if (Math.abs(nextContinuingAngularVelocity) < MIN_CONTINUING_ANGULAR_VELOCITY) {
+            nextContinuingAngularVelocity = 0.0;
+          }
+          entity.set(MouseContinuingAngularVelocity, { value: nextContinuingAngularVelocity });
+        } else {
+           console.log(`[R3FMouseCursor] Path plan ended or no plan, but ContinuingAngVel is zero. Speed: ${currentSpeed.toFixed(2)}`);
+        }
+      } else if (enableCurveball && isPathPlanActive) {
+        // If we ARE following a plan, ensure any pre-existing continuing angular velocity is not applied now,
+        // but don't zero it out in Koota if the plan just set it. It will be picked up when plan finishes.
+        // console.log(`[R3FMouseCursor] Path plan active (${pathPlanTrait?.currentIndex}/${pathPlanTrait?.segments.length}), sustained curve deferred. Current Koota ContAngVel: ${continuingAngularVelocityState?.value?.toFixed(4)}`);
+      }
+      
       // Dynamic friction calculation
       let dynamicFrictionFactor;
       if (currentSpeed <= MIN_THROW_SPEED_THRESHOLD) { // Should already be caught by speed check below, but defensive
@@ -706,11 +783,11 @@ export function VirtualMouse({ entity }: { entity: Entity }) {
       entity && <R3FMouseCursor entity={entity} />
       entity && <DebugThrowVectorLine watchEntity={entity} />
       {/* Visual Boundary Box */}
-      <mesh>
+      {/* <mesh>
         <boxGeometry args={[screenSize.width - 2 * BOUNDARY_PADDING, screenSize.height - 2 * BOUNDARY_PADDING, 0]} /> 
         <meshBasicMaterial opacity={0} transparent />
         <Edges color="cyan" lineWidth={10} />
-      </mesh>
+      </mesh> */}
 
     </Canvas>
   );
@@ -887,7 +964,8 @@ function AppContent() {
       IsThrowPending,             // Add new trait for managing lookahead state
       EnableCurveball,            // Add new trait for curveball toggle
       ThrowPathPlan,              // Add new trait for evolving curve throws
-      MouseAngularVelocityCurve   // Add new trait for storing curve parameters
+      MouseAngularVelocityCurve,   // Add new trait for storing curve parameters
+      MouseContinuingAngularVelocity // For sustained curve
     );
   }, [worldInstance]);
 
