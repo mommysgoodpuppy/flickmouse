@@ -1,4 +1,6 @@
-# Vite + Deno + React + TypeScript
+# Flick mouse with touch-sdk
+
+https://flickmouse.deno.dev/
 
 ## Running
 
