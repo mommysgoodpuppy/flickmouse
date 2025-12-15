@@ -1,6 +1,6 @@
 # Flick mouse with touch-sdk
 
-https://flickmouse.deno.dev/
+[petplay.fi/flickmouse.html](https://petplay.fi/flickmouse.html)
 
 ## Running
 
